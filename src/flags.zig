@@ -440,16 +440,13 @@ const TestArena = struct {
     fn run(self: *TestArena, comptime T: type, argv: []const []const u8) !T {
         return parse(self.arena.allocator(), argv, T, &self.diag);
     }
-    fn expect_err(self: *TestArena, expected: anyerror, comptime T: type, argv: []const []const u8) !void {
-        try std.testing.expectError(expected, self.run(T, argv));
-    }
 };
 
 test "diagnostic names unknown flag" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.UnknownFlag, Args, &.{ "prog", "--prot=80" });
+    try std.testing.expectError(error.UnknownFlag, ta.run(Args, &.{ "prog", "--prot=80" }));
     try std.testing.expectEqualStrings("--prot=80", ta.diag.token.?);
     try std.testing.expectEqualStrings("unknown flag", ta.diag.message.?);
 }
@@ -458,7 +455,7 @@ test "diagnostic names invalid value" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--port=nope" });
+    try std.testing.expectError(error.InvalidValue, ta.run(Args, &.{ "prog", "--port=nope" }));
     try std.testing.expectEqualStrings("--port=nope", ta.diag.token.?);
 }
 
@@ -466,7 +463,7 @@ test "diagnostic names unknown subcommand" {
     var ta = TestArena.init();
     defer ta.deinit();
     const CLI = union(enum) { start: struct {}, stop: struct {} };
-    try ta.expect_err(error.UnknownSubcommand, CLI, &.{ "prog", "restart" });
+    try std.testing.expectError(error.UnknownSubcommand, ta.run(CLI, &.{ "prog", "restart" }));
     try std.testing.expectEqualStrings("restart", ta.diag.token.?);
     try std.testing.expectEqualStrings("unknown subcommand", ta.diag.message.?);
 }
@@ -478,7 +475,7 @@ test "help requested at top level" {
         verbose: bool = false,
         pub const help = "Usage: app [--verbose]";
     };
-    try ta.expect_err(error.HelpRequested, Args, &.{ "prog", "--help" });
+    try std.testing.expectError(error.HelpRequested, ta.run(Args, &.{ "prog", "--help" }));
     try std.testing.expectEqualStrings("Usage: app [--verbose]", ta.diag.usage.?);
 }
 
@@ -491,7 +488,7 @@ test "help requested at subcommand level uses that level" {
             pub const help = "server help";
         },
     };
-    try ta.expect_err(error.HelpRequested, CLI, &.{ "prog", "server", "--help" });
+    try std.testing.expectError(error.HelpRequested, ta.run(CLI, &.{ "prog", "server", "--help" }));
     try std.testing.expectEqualStrings("server help", ta.diag.usage.?);
 }
 
@@ -582,7 +579,7 @@ test "bare argument rejected without positionals" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { name: []const u8 = "joe" };
-    try ta.expect_err(error.UnexpectedArgument, Args, &.{ "prog", "name=jack" });
+    try std.testing.expectError(error.UnexpectedArgument, ta.run(Args, &.{ "prog", "name=jack" }));
 }
 
 test "parse defaults" {
@@ -713,21 +710,21 @@ test "void subcommand variant with extra args" {
     var ta = TestArena.init();
     defer ta.deinit();
     const CLI = union(enum) { start: struct { port: u16 = 8080 }, stop: void };
-    try ta.expect_err(error.UnexpectedArgument, CLI, &.{ "prog", "stop", "--force" });
+    try std.testing.expectError(error.UnexpectedArgument, ta.run(CLI, &.{ "prog", "stop", "--force" }));
 }
 
 test "void subcommand variant rejects help arg" {
     var ta = TestArena.init();
     defer ta.deinit();
     const CLI = union(enum) { start: struct { port: u16 = 8080 }, stop: void };
-    try ta.expect_err(error.UnexpectedArgument, CLI, &.{ "prog", "stop", "--help" });
+    try std.testing.expectError(error.UnexpectedArgument, ta.run(CLI, &.{ "prog", "stop", "--help" }));
 }
 
 test "missing subcommand" {
     var ta = TestArena.init();
     defer ta.deinit();
     const CLI = union(enum) { start: struct { host: []const u8 = "localhost" }, stop: struct { force: bool = false } };
-    try ta.expect_err(error.MissingSubcommand, CLI, &.{"prog"});
+    try std.testing.expectError(error.MissingSubcommand, ta.run(CLI, &.{"prog"}));
 }
 
 test "unknown subcommand" {
@@ -737,21 +734,21 @@ test "unknown subcommand" {
         verbose: bool = false,
         command: union(enum) { start: struct { host: []const u8 = "localhost" }, stop: struct { force: bool = false } },
     };
-    try ta.expect_err(error.UnknownSubcommand, CLI, &.{ "prog", "--verbose", "restart" });
+    try std.testing.expectError(error.UnknownSubcommand, ta.run(CLI, &.{ "prog", "--verbose", "restart" }));
 }
 
 test "duplicate flag" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.DuplicateFlag, Args, &.{ "prog", "--port=8080", "--port=9090" });
+    try std.testing.expectError(error.DuplicateFlag, ta.run(Args, &.{ "prog", "--port=8080", "--port=9090" }));
 }
 
 test "missing value" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { name: []const u8 };
-    try ta.expect_err(error.MissingValue, Args, &.{ "prog", "--name" });
+    try std.testing.expectError(error.MissingValue, ta.run(Args, &.{ "prog", "--name" }));
 }
 
 test "invalid enum value" {
@@ -759,28 +756,28 @@ test "invalid enum value" {
     defer ta.deinit();
     const Format = enum { json, yaml, toml };
     const Args = struct { format: Format = .json };
-    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--format=xml" });
+    try std.testing.expectError(error.InvalidValue, ta.run(Args, &.{ "prog", "--format=xml" }));
 }
 
 test "invalid int value" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--port=not-a-number" });
+    try std.testing.expectError(error.InvalidValue, ta.run(Args, &.{ "prog", "--port=not-a-number" }));
 }
 
 test "no args provided" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.EmptyArgs, Args, &.{});
+    try std.testing.expectError(error.EmptyArgs, ta.run(Args, &.{}));
 }
 
 test "missing required flag" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { name: []const u8 };
-    try ta.expect_err(error.MissingRequiredFlag, Args, &.{"prog"});
+    try std.testing.expectError(error.MissingRequiredFlag, ta.run(Args, &.{"prog"}));
 }
 
 test "complex subcommand structure" {
@@ -804,7 +801,7 @@ test "unexpected argument error" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { port: u16 = 8080 };
-    try ta.expect_err(error.UnexpectedArgument, Args, &.{ "prog", "--port=8080", "extra" });
+    try std.testing.expectError(error.UnexpectedArgument, ta.run(Args, &.{ "prog", "--port=8080", "extra" }));
 }
 
 // --- Slice tests ---
@@ -890,7 +887,7 @@ test "list invalid element" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { ports: []const u16 = &.{} };
-    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--ports=80", "--ports=bad" });
+    try std.testing.expectError(error.InvalidValue, ta.run(Args, &.{ "prog", "--ports=80", "--ports=bad" }));
 }
 
 test "multiple list fields" {
@@ -948,8 +945,8 @@ test "required subcommand missing" {
         verbose: bool = false,
         command: union(enum) { serve: struct { port: u16 = 8080 }, migrate: struct { dry_run: bool = false } },
     };
-    try ta.expect_err(error.MissingSubcommand, CLI, &.{"prog"});
-    try ta.expect_err(error.MissingSubcommand, CLI, &.{ "prog", "--verbose" });
+    try std.testing.expectError(error.MissingSubcommand, ta.run(CLI, &.{"prog"}));
+    try std.testing.expectError(error.MissingSubcommand, ta.run(CLI, &.{ "prog", "--verbose" }));
 }
 
 test "default variant replaces optional subcommand" {
@@ -1016,14 +1013,14 @@ test "positional missing required" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { @"--": void, input: []const u8 };
-    try ta.expect_err(error.MissingRequiredPositional, Args, &.{"prog"});
+    try std.testing.expectError(error.MissingRequiredPositional, ta.run(Args, &.{"prog"}));
 }
 
 test "positional too many" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { @"--": void, input: []const u8 };
-    try ta.expect_err(error.TooManyPositionals, Args, &.{ "prog", "a.zig", "b.zig" });
+    try std.testing.expectError(error.TooManyPositionals, ta.run(Args, &.{ "prog", "a.zig", "b.zig" }));
 }
 
 test "positional inside subcommand" {
