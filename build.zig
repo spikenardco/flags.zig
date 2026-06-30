@@ -18,21 +18,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_flags_tests.step);
 
-    const example_mod = b.addModule("example", .{
-        .root_source_file = b.path("examples/demo.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    example_mod.addImport("flags", flags_mod);
-    const example = b.addExecutable(.{
-        .name = "demo",
-        .root_module = example_mod,
-    });
-    const run_example = b.addRunArtifact(example);
-
-    if (b.args) |args| run_example.addArgs(args);
-
-    const example_step = b.step("example", "Run the demo example");
-    example_step.dependOn(&run_example.step);
+    inline for (.{
+        .{ "example", "examples/demo.zig" },
+        .{ "demo", "examples/demo.zig" },
+        .{ "git", "examples/git.zig" },
+        .{ "list_flags", "examples/list_flags.zig" },
+        .{ "positionals", "examples/positionals.zig" },
+    }) |ex| {
+        const ex_mod = b.addModule(ex[0], .{
+            .root_source_file = b.path(ex[1]),
+            .target = target,
+            .optimize = optimize,
+        });
+        ex_mod.addImport("flags", flags_mod);
+        const ex_exe = b.addExecutable(.{
+            .name = ex[0],
+            .root_module = ex_mod,
+        });
+        const run_ex = b.addRunArtifact(ex_exe);
+        if (b.args) |args| run_ex.addArgs(args);
+        const step = b.step(ex[0], "Run the " ++ ex[0] ++ " example");
+        step.dependOn(&run_ex.step);
+    }
 }

@@ -13,10 +13,11 @@ A type-safe command-line argument parser for Zig. Taking inspiration from **Rust
 - [x] Struct-based argument definition
 - [x] Default values via struct fields
 - [x] Error handling for invalid/unknown flags
-- [x] Positional arguments support
+- [x] Positional arguments via `positional` struct
 - [x] Subcommands via `union(enum)`
-- [x] Slice support (multiple values per flag)
-- [x] Two parsing patterns: repeated, comma-separated
+- [x] Repeatable list flags (`--x=a --x=b`)
+- [x] Auto-generated `--help`
+- [x] Structured errors via `Diagnostic`
 
 ## Installation
 
@@ -43,50 +44,46 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    // Define flags as a struct with slice support
+    // Define flags as a struct
     const Args = struct {
         name: []const u8 = "world",
         age: u32 = 25,
         active: bool = false,
-        
-        // Multiple values supported
-        files: []const []const u8 = &[_][]const u8{},
-        ports: []u16 = &[_]u16{8080},
+        files: []const []const u8 = &.{},
     };
 
-    const parsed = try flags.parse(allocator, args, Args);
-    defer flags.deinit(allocator, parsed);
+    var diag: flags.Diagnostic = .{};
+    const parsed = flags.parse(allocator, args, Args, &diag) catch |err| {
+        diag.report();
+        std.process.exit(if (err == error.HelpRequested) 0 else 1);
+    };
 
     std.debug.print("Hello {s}! Age: {d}, Active: {}\n", .{
-        parsed.name, parsed.age, parsed.active
+        parsed.name, parsed.age, parsed.active,
     });
 }
 ```
 
 ```bash
 ./program --name=alice --age=30 --active
-
-# Slices accept repeated flags or comma-separated values
 ./program --files=a.txt --files=b.txt --files=c.txt
-./program --files=a.txt,b.txt,c.txt
+./program --help
 ```
 
 ## Advanced Features
 
 ### Help Documentation
 
-Running with `-h` or `--help` prints your help text.
+Running with `-h` or `--help` prints auto-generated usage text derived from your schema type. Help is auto-generated at comptime, so it always reflects the actual flag names and types.
 
-If no help declaration is found, it prints "No help available" with a hint to declare one.
-
-Help text is defined by declaring `pub const help` on your struct or union type:
+If a type declares `pub const help`, that string overrides auto-generation:
 
 ```zig
 const Args = struct {
     verbose: bool = false,
     port: u16 = 8080,
-    
-    pub const help = 
+
+    pub const help =
         \\Options:
         \\  --verbose    Enable verbose output (default: false)
         \\  --port       Port to listen on (default: 8080)
@@ -107,19 +104,13 @@ const CLI = union(enum) {
     stop: struct {
         force: bool = false,
     },
-    
-    pub const help = 
-        \\ Server management CLI
-        \\ commands:
-        \\  start       Start the server
-        \\      --host     Hostname to bind to (default: localhost)
-        \\      --port     Port to listen on (default: 8080)
-        \\  stop        Stop the server
-        \\      --force    Force stop (default: false)
-    ;
 };
 
-const cli = try flags.parse(allocator, args, CLI);
+var diag: flags.Diagnostic = .{};
+const cli = flags.parse(allocator, args, CLI, &diag) catch |err| {
+    diag.report();
+    std.process.exit(if (err == error.HelpRequested) 0 else 1);
+};
 switch (cli) {
     .start => |s| startServer(s.host, s.port),
     .stop => |s| stopServer(s.force),
@@ -145,7 +136,11 @@ const CLI = struct {
     },
 };
 
-const cli = try flags.parse(allocator, args, CLI);
+var diag: flags.Diagnostic = .{};
+const cli = flags.parse(allocator, args, CLI, &diag) catch |err| {
+    diag.report();
+    std.process.exit(if (err == error.HelpRequested) 0 else 1);
+};
 if (cli.verbose) std.debug.print("verbose mode\n", .{});
 switch (cli.command) {
     .serve => |s| startServer(s.host, s.port),
@@ -160,23 +155,36 @@ prog --config=app.toml migrate --dry_run
 
 ### Positional Arguments
 
-Use the `@"--"` marker to separate flags from positional arguments:
+Positional arguments are grouped into a reserved `positional` field:
 
 ```zig
 const Args = struct {
     verbose: bool = false,
-    @"--": void,
-    input: []const u8,
-    output: []const u8 = "output.txt",
+    positional: struct {
+        input: []const u8,
+        output: []const u8 = "output.txt",
+    },
 };
 
 // Usage: program --verbose input.txt output.txt
+// Access: args.positional.input, args.positional.output
 ```
 
 **Note:** All flag arguments (`--name=value`) must appear before any positional arguments. Once the first positional value is parsed, subsequent `--flag` arguments are treated as positional values. Use the explicit `--` separator to disambiguate:
 
 ```bash
-program --verbose -- input.txt --flag-is-positional
+program --verbose -- -filename --looks-like-flag
+```
+
+### Subcommands without optional unions
+
+Optional subcommands (`command: ?union = null`) are not supported. Use a `default` variant instead:
+
+```zig
+command: union(enum) {
+    default: struct {},
+    serve:   struct { port: u16 = 8080 },
+} = .{ .default = .{} },
 ```
 
 ## Best Practices
@@ -184,7 +192,7 @@ program --verbose -- input.txt --flag-is-positional
 ### DO
 
 1. **Use struct defaults** for common values
-2. **Define help** via `pub const help` declarations
+2. **Define help** via `pub const help` declarations when you need hand-written text
 3. **Use unions** for mutually exclusive subcommands
 4. **Leverage enums** for constrained choices
 5. **Use optional types** for truly optional flags
@@ -213,11 +221,23 @@ The parser extracts typed values. What you do with them is your business.
 - **No short flags** — only long flags (`--flag=value`), except `-h` for help. For brevity, use `--v` instead of `-v`
 - **No custom types** — only built-in types and enums
 - **No nested slices** — slices of slices not supported (`[][]T`)
+- **No comma-separated lists** — use repeated flags (`--x=a --x=b`)
+- **No optional subcommands** — use a `default` variant
 - **Equals syntax only** — use `--name=value` not `--name value`
 - **Strict boolean values** — only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.)
 - **No subcommands + positional args** — use either subcommands or positional arguments, not both in the same struct
 
+## Migration (from 0.1)
+
+- `flags.parse(a, args, T)` → `flags.parse(a, args, T, &diag)` with `var diag: flags.Diagnostic = .{};`
+- Remove `defer flags.deinit(...)`; use an arena allocator instead (nothing to free).
+- `--tags=a,b` → `--tags=a --tags=b` (comma lists removed).
+- `@"--": void` + trailing fields → `positional: struct { ... }`, accessed as `result.positional.<name>`.
+- `command: ?union = null` → a required union with a `default: struct {}` variant.
+- Handle `error.HelpRequested` in your `catch` (print `diag.usage` via `diag.report()`, exit 0).
+
 ## Credits
+
 This library draws significant inspiration from two exceptional projects:
 
 - [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle) — struct-based flag definitions and zero-cost abstractions
