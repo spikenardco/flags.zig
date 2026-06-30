@@ -1,12 +1,13 @@
 const std = @import("std");
 const flags = @import("flags");
 
+const Color = enum { red, green, blue };
+const LogLevel = enum { debug, info, warn, err };
+
 const Args = struct {
+    color: Color = .blue,
+    level: LogLevel = .info,
     verbose: bool = false,
-    @"--": void,
-    input: []const u8,
-    output: []const u8 = "out.txt",
-    mode: enum { read, write, append } = .write,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -19,8 +20,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(if (err == error.HelpRequested) 0 else 1);
     };
 
-    if (cli.verbose) {
-        std.debug.print("mode: {s}\n", .{@tagName(cli.mode)});
-    }
-    std.debug.print("copying {s} to {s}\n", .{ cli.input, cli.output });
+    std.debug.print("color: {s}\n", .{@tagName(cli.color)});
+    std.debug.print("level: {s}\n", .{@tagName(cli.level)});
+    if (cli.verbose) std.debug.print("verbose: true\n", .{});
 }

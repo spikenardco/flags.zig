@@ -1,5 +1,5 @@
 /// Arena-based, type-driven CLI parser with typed flags, list flags, subcommands,
-/// grouped positionals, comptime-generated help, and structured errors via Diagnostic.
+/// positional args, comptime-generated help, and structured errors via Diagnostic.
 const std = @import("std");
 
 /// Carries error context out of `parse` so the caller can render messages and
@@ -67,16 +67,10 @@ fn apply_default(comptime field: std.builtin.Type.StructField, result: anytype, 
     }
 }
 
-/// True if the field is the reserved positional-arguments group.
-fn is_positional_field(comptime field: std.builtin.Type.StructField) bool {
-    return std.mem.eql(u8, field.name, "positional") and
-        @typeInfo(field.type) == .@"struct";
-}
-
-/// Find the index of the reserved `positional` struct field, if any.
-fn positional_field_index(comptime fields: []const std.builtin.Type.StructField) ?usize {
-    inline for (fields, 0..) |field, i| {
-        if (is_positional_field(field)) return i;
+/// Find the index of the `@"--"` field that separates flags from positional args.
+fn separator_index(comptime fields: []const std.builtin.Type.StructField) ?usize {
+    inline for (fields, 0..) |field, index| {
+        if (std.mem.eql(u8, field.name, "--")) return index;
     }
     return null;
 }
@@ -84,24 +78,27 @@ fn positional_field_index(comptime fields: []const std.builtin.Type.StructField)
 /// Parse a struct schema of named flags and optional positional args.
 fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
-    const pos_idx = comptime positional_field_index(fields);
-    const subcmd_idx = comptime find_subcommand_field(fields);
-    if (comptime subcmd_idx != null and pos_idx != null) {
+    const marker_idx = comptime separator_index(fields);
+    const named_fields = if (marker_idx) |idx| fields[0..idx] else fields;
+    const positional_fields = if (marker_idx) |idx| fields[idx + 1 ..] else &[_]std.builtin.Type.StructField{};
+
+    if (marker_idx) |idx| {
+        if (fields[idx].type != void) {
+            @compileError("'@"--"' marker must be declared as void");
+        }
+    }
+
+    const subcmd_idx = comptime find_subcommand_field(named_fields);
+    if (comptime subcmd_idx != null and positional_fields.len > 0) {
         @compileError("subcommands and positional arguments cannot coexist in the same struct");
     }
 
-    const pos_fields = if (pos_idx) |pi|
-        std.meta.fields(fields[pi].type)
-    else
-        &[_]std.builtin.Type.StructField{};
-
     var result: T = undefined;
-    var seen = std.mem.zeroes([fields.len]bool);
+    var seen = std.mem.zeroes([named_fields.len]bool);
     var positional_index: usize = 0;
-    var positional_only = false;
 
-    var list_values = std.mem.zeroes([fields.len]std.ArrayList([]const u8));
-    inline for (fields, 0..) |field, fi| {
+    var list_values = std.mem.zeroes([named_fields.len]std.ArrayList([]const u8));
+    inline for (named_fields, 0..) |field, fi| {
         if (comptime is_list_flag(field.type)) list_values[fi] = .empty;
     }
 
@@ -114,17 +111,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             return error.HelpRequested;
         }
 
-        if (std.mem.eql(u8, arg, "--")) {
-            if (pos_idx == null) {
-                diag.token = arg;
-                diag.message = "unexpected argument";
-                return error.UnexpectedArgument;
-            }
-            positional_only = true;
-            continue;
-        }
-
-        if (std.mem.startsWith(u8, arg, "--") and !positional_only) {
+        if (std.mem.startsWith(u8, arg, "--")) {
             const trimmed = arg[2..];
             var flag_name = trimmed;
             var flag_value: ?[]const u8 = null;
@@ -135,8 +122,8 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             }
 
             var found = false;
-            inline for (fields, 0..) |field, field_index| {
-                if (comptime is_subcommand_field(field) or is_positional_field(field)) continue;
+            inline for (named_fields, 0..) |field, field_index| {
+                if (comptime is_subcommand_field(field)) continue;
                 if (std.mem.eql(u8, flag_name, field.name)) {
                     found = true;
 
@@ -173,35 +160,35 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             continue;
         }
 
-        if (!positional_only and std.mem.startsWith(u8, arg, "-")) {
+        if (std.mem.startsWith(u8, arg, "-")) {
             diag.token = arg;
             diag.message = "unexpected argument";
             return error.UnexpectedArgument;
         }
 
         if (comptime subcmd_idx) |si| {
-            const subcmd_field = fields[si];
+            const subcmd_field = named_fields[si];
             const parsed = try dispatch_subcommand(allocator, args[i..], subcmd_field.type, diag);
             @field(result, subcmd_field.name) = parsed;
             seen[si] = true;
             break;
         }
 
-        if (pos_idx == null) {
+        if (positional_fields.len == 0) {
             diag.token = arg;
             diag.message = "unexpected argument";
             return error.UnexpectedArgument;
         }
 
-        if (positional_index >= pos_fields.len) {
+        if (positional_index >= positional_fields.len) {
             diag.token = arg;
             diag.message = "too many positional arguments";
             return error.TooManyPositionals;
         }
 
-        inline for (pos_fields, 0..) |pfield, pi| {
+        inline for (positional_fields, 0..) |pfield, pi| {
             if (pi == positional_index) {
-                @field(@field(result, fields[pos_idx.?].name), pfield.name) = parse_value(pfield.type, arg) catch |e| {
+                @field(result, pfield.name) = parse_value(pfield.type, arg) catch |e| {
                     diag.token = arg;
                     diag.message = "invalid value";
                     return e;
@@ -209,13 +196,10 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             }
         }
         positional_index += 1;
-        positional_only = true;
     }
 
-    // Build slices and apply defaults.
-    inline for (fields, 0..) |field, field_index| {
-        if (comptime is_positional_field(field)) continue;
-
+    // Build slices and apply defaults for named fields.
+    inline for (named_fields, 0..) |field, field_index| {
         if (comptime is_subcommand_field(field)) {
             if (!seen[field_index]) {
                 try apply_default(field, &result, error.MissingSubcommand);
@@ -246,11 +230,9 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     }
 
     // Apply defaults for missing positional args.
-    if (pos_idx) |pi| {
-        inline for (pos_fields, 0..) |pfield, pj| {
-            if (pj >= positional_index) {
-                try apply_default(pfield, &@field(result, fields[pi].name), error.MissingRequiredPositional);
-            }
+    inline for (positional_fields, 0..) |pfield, pi| {
+        if (pi >= positional_index) {
+            try apply_default(pfield, &result, error.MissingRequiredPositional);
         }
     }
 
@@ -396,7 +378,7 @@ fn generate_struct_usage(comptime T: type) []const u8 {
         var flags_text: []const u8 = "";
         var cmds_text: []const u8 = "";
         for (std.meta.fields(T)) |field| {
-            if (is_positional_field(field)) continue;
+            if (std.mem.eql(u8, field.name, "--")) continue;
             if (is_subcommand_field(field)) {
                 for (std.meta.fields(field.type)) |variant| {
                     cmds_text = cmds_text ++ "  " ++ variant.name ++ "\n";
@@ -1009,38 +991,38 @@ test "positional basic" {
     defer ta.deinit();
     const Args = struct {
         verbose: bool = false,
-        positional: struct {
-            input: []const u8,
-            output: []const u8 = "out.txt",
-        },
+        @"--": void,
+        input: []const u8,
+        output: []const u8 = "out.txt",
     };
     const result = try ta.run(Args, &.{ "prog", "--verbose", "main.zig" });
     try std.testing.expectEqual(true, result.verbose);
-    try std.testing.expectEqualStrings("main.zig", result.positional.input);
-    try std.testing.expectEqualStrings("out.txt", result.positional.output);
+    try std.testing.expectEqualStrings("main.zig", result.input);
+    try std.testing.expectEqualStrings("out.txt", result.output);
 }
 
-test "positional with explicit separator and dash values" {
+test "positional single value" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct {
-        positional: struct { value: i32 },
+        @"--": void,
+        value: i32,
     };
-    const result = try ta.run(Args, &.{ "prog", "--", "-5" });
-    try std.testing.expectEqual(-5, result.positional.value);
+    const result = try ta.run(Args, &.{ "prog", "42" });
+    try std.testing.expectEqual(42, result.value);
 }
 
 test "positional missing required" {
     var ta = TestArena.init();
     defer ta.deinit();
-    const Args = struct { positional: struct { input: []const u8 } };
+    const Args = struct { @"--": void, input: []const u8 };
     try ta.expect_err(error.MissingRequiredPositional, Args, &.{"prog"});
 }
 
 test "positional too many" {
     var ta = TestArena.init();
     defer ta.deinit();
-    const Args = struct { positional: struct { input: []const u8 } };
+    const Args = struct { @"--": void, input: []const u8 };
     try ta.expect_err(error.TooManyPositionals, Args, &.{ "prog", "a.zig", "b.zig" });
 }
 
@@ -1052,18 +1034,17 @@ test "positional inside subcommand" {
         command: union(enum) {
             compile: struct {
                 optimize: bool = false,
-                positional: struct {
-                    input: []const u8,
-                    output: []const u8 = "a.out",
-                },
+                @"--": void,
+                input: []const u8,
+                output: []const u8 = "a.out",
             },
         },
     };
     const result = try ta.run(CLI, &.{ "prog", "--verbose", "compile", "--optimize", "main.zig" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(true, result.command.compile.optimize);
-    try std.testing.expectEqualStrings("main.zig", result.command.compile.positional.input);
-    try std.testing.expectEqualStrings("a.out", result.command.compile.positional.output);
+    try std.testing.expectEqualStrings("main.zig", result.command.compile.input);
+    try std.testing.expectEqualStrings("a.out", result.command.compile.output);
 }
 
 // --- List (ex-deinit) tests ---

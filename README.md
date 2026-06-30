@@ -155,26 +155,23 @@ prog --config=app.toml migrate --dry_run
 
 ### Positional Arguments
 
-Positional arguments are grouped into a reserved `positional` field:
+Use the `@"--"` marker to separate flags from positional arguments:
 
 ```zig
 const Args = struct {
     verbose: bool = false,
-    positional: struct {
-        input: []const u8,
-        output: []const u8 = "output.txt",
-    },
+    @"--": void,
+    input: []const u8,
+    output: []const u8 = "output.txt",
 };
 
 // Usage: program --verbose input.txt output.txt
-// Access: args.positional.input, args.positional.output
+// Access: args.input, args.output
 ```
 
-**Note:** All flag arguments (`--name=value`) must appear before any positional arguments. Once the first positional value is parsed, subsequent `--flag` arguments are treated as positional values. Use the explicit `--` separator to disambiguate:
-
-```bash
-program --verbose -- -filename --looks-like-flag
-```
+Positional arguments are bare words that don't start with `-`. They can be
+interleaved with flags in any order. A bare argument starting with `-` is
+rejected (this library only supports `--name=value` flag syntax).
 
 ### Subcommands without optional unions
 
@@ -232,7 +229,7 @@ The parser extracts typed values. What you do with them is your business.
 - `flags.parse(a, args, T)` → `flags.parse(a, args, T, &diag)` with `var diag: flags.Diagnostic = .{};`
 - Remove `defer flags.deinit(...)`; use an arena allocator instead (nothing to free).
 - `--tags=a,b` → `--tags=a --tags=b` (comma lists removed).
-- `@"--": void` + trailing fields → `positional: struct { ... }`, accessed as `result.positional.<name>`.
+- `positional: struct { ... }` → `@"--": void` + trailing fields, accessed as `result.<name>`.
 - `command: ?union = null` → a required union with a `default: struct {}` variant.
 - Handle `error.HelpRequested` in your `catch` (print `diag.usage` via `diag.report()`, exit 0).
 
