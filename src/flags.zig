@@ -106,7 +106,10 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        if (is_help_arg(arg)) print_help(T);
+        if (is_help_arg(arg)) {
+            diag.usage = comptime usage(T);
+            return error.HelpRequested;
+        }
 
         if (std.mem.eql(u8, arg, "--")) {
             if (positional_fields.len == 0) {
@@ -322,7 +325,10 @@ fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, compti
     if (args.len == 0) return error.MissingSubcommand;
 
     const arg = args[0];
-    if (is_help_arg(arg)) print_help(T);
+    if (is_help_arg(arg)) {
+        diag.usage = comptime usage(T);
+        return error.HelpRequested;
+    }
 
     inline for (fields) |field| {
         if (std.mem.eql(u8, arg, field.name)) {
@@ -378,14 +384,16 @@ fn is_help_arg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-/// Print help text and exit.
-fn print_help(comptime T: type) void {
-    if (@hasDecl(T, "help")) {
-        std.debug.print("{s}\n", .{T.help});
-    } else {
-        std.debug.print("No help available. Declare `pub const help` on your type.\n", .{});
-    }
-    std.process.exit(0);
+/// Public: the usage text for a type. Uses `pub const help` if declared,
+/// otherwise the comptime-generated usage (Task 4).
+pub fn usage(comptime T: type) []const u8 {
+    if (@hasDecl(T, "help")) return T.help;
+    return render_usage(T);
+}
+
+/// Comptime-generated usage. Replaced with full generation in Task 4.
+fn render_usage(comptime _: type) []const u8 {
+    return "No help available. Declare `pub const help` on your type.";
 }
 
 // =============================================================================
@@ -434,6 +442,30 @@ test "diagnostic names unknown subcommand" {
     try ta.expect_err(error.UnknownSubcommand, CLI, &.{ "prog", "restart" });
     try std.testing.expectEqualStrings("restart", ta.diag.token.?);
     try std.testing.expectEqualStrings("unknown subcommand", ta.diag.message.?);
+}
+
+test "help requested at top level" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct {
+        verbose: bool = false,
+        pub const help = "Usage: app [--verbose]";
+    };
+    try ta.expect_err(error.HelpRequested, Args, &.{ "prog", "--help" });
+    try std.testing.expectEqualStrings("Usage: app [--verbose]", ta.diag.usage.?);
+}
+
+test "help requested at subcommand level uses that level" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) {
+        server: struct {
+            port: u16 = 8080,
+            pub const help = "server help";
+        },
+    };
+    try ta.expect_err(error.HelpRequested, CLI, &.{ "prog", "server", "--help" });
+    try std.testing.expectEqualStrings("server help", ta.diag.usage.?);
 }
 
 test "auto help generation" {
