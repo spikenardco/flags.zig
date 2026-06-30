@@ -1,4 +1,5 @@
-/// Comptime-first CLI parser with typed flags, positional args, subcommands, and slices.
+/// Arena-based, type-driven CLI parser with typed flags, list flags, subcommands,
+/// grouped positionals, comptime-generated help, and structured errors via Diagnostic.
 const std = @import("std");
 
 /// Carries error context out of `parse` so the caller can render messages and
@@ -31,7 +32,9 @@ pub const Diagnostic = struct {
 ///
 /// Caller passes full argv; the parser skips argv[0] (the program name).
 ///
-/// Allocator is used for slice field allocation; caller owns returned memory.
+/// Allocator is an arena owned by the caller; the parser never frees and never exits.
+/// Pass a `*Diagnostic` to receive structured error context or usage text on
+/// `error.HelpRequested`.
 pub fn parse(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -42,12 +45,12 @@ pub fn parse(
     const trimmed = args[1..];
     const info = @typeInfo(T);
     switch (info) {
-        .@"struct" => return parse_struct(allocator, trimmed, T, diag),
+        .@"struct" => return parse_flags(allocator, trimmed, T, diag),
         .@"union" => {
             if (info.@"union".tag_type == null) {
                 @compileError("Args must be a union(enum) to use subcommands");
             }
-            return parse_commands(allocator, trimmed, T, diag);
+            return dispatch_subcommand(allocator, trimmed, T, diag);
         },
         else => @compileError("Args must be a struct or union(enum)"),
     }
@@ -79,10 +82,10 @@ fn positional_field_index(comptime fields: []const std.builtin.Type.StructField)
 }
 
 /// Parse a struct schema of named flags and optional positional args.
-fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
+fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
     const pos_idx = comptime positional_field_index(fields);
-    const subcmd_idx = comptime subcommand_field_index(fields);
+    const subcmd_idx = comptime find_subcommand_field(fields);
     if (comptime subcmd_idx != null and pos_idx != null) {
         @compileError("subcommands and positional arguments cannot coexist in the same struct");
     }
@@ -106,7 +109,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        if (is_help_arg(arg)) {
+        if (is_help_flag(arg)) {
             diag.usage = comptime usage(T);
             return error.HelpRequested;
         }
@@ -133,7 +136,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
             var found = false;
             inline for (fields, 0..) |field, field_index| {
-                if (comptime is_union_subcommand(field) or is_positional_field(field)) continue;
+                if (comptime is_subcommand_field(field) or is_positional_field(field)) continue;
                 if (std.mem.eql(u8, flag_name, field.name)) {
                     found = true;
 
@@ -178,7 +181,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
         if (comptime subcmd_idx) |si| {
             const subcmd_field = fields[si];
-            const parsed = try parse_commands(allocator, args[i..], subcmd_field.type, diag);
+            const parsed = try dispatch_subcommand(allocator, args[i..], subcmd_field.type, diag);
             @field(result, subcmd_field.name) = parsed;
             seen[si] = true;
             break;
@@ -213,7 +216,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
     inline for (fields, 0..) |field, field_index| {
         if (comptime is_positional_field(field)) continue;
 
-        if (comptime is_union_subcommand(field)) {
+        if (comptime is_subcommand_field(field)) {
             if (!seen[field_index]) {
                 try apply_default(field, &result, error.MissingSubcommand);
             }
@@ -290,7 +293,7 @@ fn parse_bool(value: []const u8) !bool {
 }
 
 /// Parse a subcommand field as either a struct or nested union(enum).
-fn parse_subcommand(
+fn parse_variant(
     allocator: std.mem.Allocator,
     comptime field: std.builtin.Type.UnionField,
     args: []const []const u8,
@@ -298,12 +301,12 @@ fn parse_subcommand(
 ) !field.type {
     const subcommand_info = @typeInfo(field.type);
     return switch (subcommand_info) {
-        .@"struct" => try parse_struct(allocator, args, field.type, diag),
+        .@"struct" => try parse_flags(allocator, args, field.type, diag),
         .@"union" => blk: {
             if (subcommand_info.@"union".tag_type == null) {
                 @compileError("subcommand types must be struct or union(enum)");
             }
-            break :blk try parse_commands(allocator, args, field.type, diag);
+            break :blk try dispatch_subcommand(allocator, args, field.type, diag);
         },
         .void => if (args.len > 0) blk: {
             diag.token = args[0];
@@ -315,20 +318,20 @@ fn parse_subcommand(
 }
 
 /// Match and parse the first arg as a subcommand name, then parse the rest.
-fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
+fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
 
     if (args.len == 0) return error.MissingSubcommand;
 
     const arg = args[0];
-    if (is_help_arg(arg)) {
+    if (is_help_flag(arg)) {
         diag.usage = comptime usage(T);
         return error.HelpRequested;
     }
 
     inline for (fields) |field| {
         if (std.mem.eql(u8, arg, field.name)) {
-            const parsed = try parse_subcommand(allocator, field, args[1..], diag);
+            const parsed = try parse_variant(allocator, field, args[1..], diag);
             return @unionInit(T, field.name, parsed);
         }
     }
@@ -347,7 +350,7 @@ fn is_list_flag(comptime T: type) bool {
 }
 
 /// Check whether a struct field is a union(enum) subcommand carrier.
-fn is_union_subcommand(comptime field: std.builtin.Type.StructField) bool {
+fn is_subcommand_field(comptime field: std.builtin.Type.StructField) bool {
     return switch (@typeInfo(field.type)) {
         .@"union" => |u| u.tag_type != null,
         else => false,
@@ -355,10 +358,10 @@ fn is_union_subcommand(comptime field: std.builtin.Type.StructField) bool {
 }
 
 /// Find the index of the single union(enum) subcommand field, if any.
-fn subcommand_field_index(comptime fields: []const std.builtin.Type.StructField) ?usize {
+fn find_subcommand_field(comptime fields: []const std.builtin.Type.StructField) ?usize {
     var idx: ?usize = null;
     for (fields, 0..) |field, i| {
-        if (is_union_subcommand(field)) {
+        if (is_subcommand_field(field)) {
             if (idx != null) @compileError("only one union(enum) subcommand field is allowed");
             idx = i;
         }
@@ -367,7 +370,7 @@ fn subcommand_field_index(comptime fields: []const std.builtin.Type.StructField)
 }
 
 /// Return true if the argument is a help flag (-h or --help).
-fn is_help_arg(arg: []const u8) bool {
+fn is_help_flag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
@@ -394,7 +397,7 @@ fn generate_struct_usage(comptime T: type) []const u8 {
         var cmds_text: []const u8 = "";
         for (std.meta.fields(T)) |field| {
             if (is_positional_field(field)) continue;
-            if (is_union_subcommand(field)) {
+            if (is_subcommand_field(field)) {
                 for (std.meta.fields(field.type)) |variant| {
                     cmds_text = cmds_text ++ "  " ++ variant.name ++ "\n";
                 }
@@ -560,6 +563,20 @@ test "pub const help overrides auto usage" {
         pub const help = "custom";
     };
     try std.testing.expectEqualStrings("custom", comptime usage(Args));
+}
+
+test "parse_scalar table" {
+    const Color = enum { red, green };
+    inline for (.{
+        .{ u16, "42", @as(u16, 42) },
+        .{ i32, "-7", @as(i32, -7) },
+        .{ f32, "1.5", @as(f32, 1.5) },
+        .{ bool, "true", true },
+        .{ bool, "false", false },
+        .{ Color, "green", Color.green },
+    }) |row| {
+        try std.testing.expectEqual(row[2], try parse_scalar(row[0], row[1]));
+    }
 }
 
 test "auto help generation" {
