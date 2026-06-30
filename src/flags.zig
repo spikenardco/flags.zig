@@ -178,13 +178,8 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
         if (comptime subcmd_idx) |si| {
             const subcmd_field = fields[si];
-            const SubT = unwrap_optional(subcmd_field.type);
-            const parsed = try parse_commands(allocator, args[i..], SubT, diag);
-            if (comptime @typeInfo(subcmd_field.type) == .optional) {
-                @field(result, subcmd_field.name) = @as(subcmd_field.type, parsed);
-            } else {
-                @field(result, subcmd_field.name) = parsed;
-            }
+            const parsed = try parse_commands(allocator, args[i..], subcmd_field.type, diag);
+            @field(result, subcmd_field.name) = parsed;
             seen[si] = true;
             break;
         }
@@ -351,18 +346,9 @@ fn is_list_flag(comptime T: type) bool {
     };
 }
 
-/// Unwrap an optional type to its child, or return the type as-is.
-fn unwrap_optional(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .optional => |opt| opt.child,
-        else => T,
-    };
-}
-
 /// Check whether a struct field is a union(enum) subcommand carrier.
 fn is_union_subcommand(comptime field: std.builtin.Type.StructField) bool {
-    const T = unwrap_optional(field.type);
-    return switch (@typeInfo(T)) {
+    return switch (@typeInfo(field.type)) {
         .@"union" => |u| u.tag_type != null,
         else => false,
     };
@@ -409,8 +395,7 @@ fn generate_struct_usage(comptime T: type) []const u8 {
         for (std.meta.fields(T)) |field| {
             if (is_positional_field(field)) continue;
             if (is_union_subcommand(field)) {
-                const SubT = unwrap_optional(field.type);
-                for (std.meta.fields(SubT)) |variant| {
+                for (std.meta.fields(field.type)) |variant| {
                     cmds_text = cmds_text ++ "  " ++ variant.name ++ "\n";
                 }
             } else {
@@ -968,16 +953,22 @@ test "required subcommand missing" {
     try ta.expect_err(error.MissingSubcommand, CLI, &.{ "prog", "--verbose" });
 }
 
-test "optional subcommand not given" {
+test "default variant replaces optional subcommand" {
     var ta = TestArena.init();
     defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: ?union(enum) { serve: struct { port: u16 = 8080 } } = null,
+        command: union(enum) {
+            default: struct {},
+            serve: struct { port: u16 = 8080 },
+        } = .{ .default = .{} },
     };
-    const result = try ta.run(CLI, &.{ "prog", "--verbose" });
-    try std.testing.expectEqual(true, result.verbose);
-    try std.testing.expectEqual(null, result.command);
+    const bare = try ta.run(CLI, &.{ "prog", "--verbose" });
+    try std.testing.expectEqual(true, bare.verbose);
+    try std.testing.expect(bare.command == .default);
+
+    const served = try ta.run(CLI, &.{ "prog", "serve", "--port=3000" });
+    try std.testing.expectEqual(3000, served.command.serve.port);
 }
 
 test "subcommand with nested union" {
@@ -1100,18 +1091,6 @@ test "list fields with defaults only" {
     const result = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqual(0, result.files.len);
     try std.testing.expectEqual(0, result.ports.len);
-}
-
-test "optional subcommand null" {
-    var ta = TestArena.init();
-    defer ta.deinit();
-    const CLI = struct {
-        verbose: bool = false,
-        command: ?union(enum) { serve: struct { hosts: []const []const u8 = &.{} } } = null,
-    };
-    const result = try ta.run(CLI, &.{ "prog", "--verbose" });
-    try std.testing.expectEqual(true, result.verbose);
-    try std.testing.expectEqual(null, result.command);
 }
 
 test "list_values array with non-list and list fields" {
