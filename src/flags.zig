@@ -95,11 +95,9 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
     var positional_index: usize = 0;
     var positional_only = false;
 
-    var slice_lists = std.mem.zeroes([named_fields.len]std.ArrayList([]const u8));
+    var list_values = std.mem.zeroes([named_fields.len]std.ArrayList([]const u8));
     inline for (named_fields, 0..) |field, fi| {
-        if (comptime is_slice_type(field.type)) {
-            slice_lists[fi] = .empty;
-        }
+        if (comptime is_list_flag(field.type)) list_values[fi] = .empty;
     }
 
     var i: usize = 0;
@@ -137,16 +135,13 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
                 if (std.mem.eql(u8, flag_name, field.name)) {
                     found = true;
 
-                    if (comptime is_slice_type(field.type)) {
+                    if (comptime is_list_flag(field.type)) {
                         const fv = flag_value orelse {
                             diag.token = arg;
                             diag.message = "missing value for flag";
                             return error.MissingValue;
                         };
-                        var iter = std.mem.splitScalar(u8, fv, ',');
-                        while (iter.next()) |part| {
-                            try slice_lists[field_index].append(allocator, part);
-                        }
+                        try list_values[field_index].append(allocator, fv);
                         seen[field_index] = true;
                     } else {
                         if (seen[field_index]) {
@@ -223,9 +218,9 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
             if (!seen[field_index]) {
                 try apply_default(field, &result, error.MissingSubcommand);
             }
-        } else if (comptime is_slice_type(field.type)) {
+        } else if (comptime is_list_flag(field.type)) {
             if (seen[field_index]) {
-                const items = slice_lists[field_index].items;
+                const items = list_values[field_index].items;
                 const child = comptime @typeInfo(field.type).pointer.child;
                 const typed = try allocator.alloc(child, items.len);
                 for (items, 0..) |raw, j| {
@@ -342,8 +337,8 @@ fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, compti
     return error.UnknownSubcommand;
 }
 
-/// Return true if the type is a slice type (not []const u8 which is a string).
-fn is_slice_type(comptime T: type) bool {
+/// Return true if the type is a list flag (a `[]const T` slice where `T != u8`; strings are not lists).
+fn is_list_flag(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .pointer => |ptr| ptr.size == .slice and ptr.child != u8,
         else => false,
@@ -435,7 +430,7 @@ fn generate_union_usage(comptime T: type) []const u8 {
 
 fn default_label(comptime field: std.builtin.Type.StructField) []const u8 {
     if (@typeInfo(field.type) == .optional) return " (optional)";
-    if (is_slice_type(field.type)) return " (repeatable)";
+    if (is_list_flag(field.type)) return " (repeatable)";
     if (field.defaultValue()) |d| {
         return " (default: " ++ value_to_string(field.type, d) ++ ")";
     }
@@ -823,7 +818,7 @@ test "unexpected argument error" {
 
 // --- Slice tests ---
 
-test "slice repeated flags" {
+test "list repeated flags" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { files: []const []const u8 = &.{} };
@@ -834,29 +829,26 @@ test "slice repeated flags" {
     try std.testing.expectEqualStrings("c.txt", result.files[2]);
 }
 
-test "slice comma separated" {
+test "list does not split on commas" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { files: []const []const u8 = &.{} };
-    const str_result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt,c.txt" });
-    try std.testing.expectEqual(3, str_result.files.len);
-    try std.testing.expectEqualStrings("a.txt", str_result.files[0]);
-    try std.testing.expectEqualStrings("b.txt", str_result.files[1]);
-    try std.testing.expectEqualStrings("c.txt", str_result.files[2]);
-
-    const single_str_result = try ta.run(Args, &.{ "prog", "--files=single.txt" });
-    try std.testing.expectEqual(1, single_str_result.files.len);
-    try std.testing.expectEqualStrings("single.txt", single_str_result.files[0]);
-
-    const IntArgs = struct { ports: []const u16 = &.{} };
-    const int_result = try ta.run(IntArgs, &.{ "prog", "--ports=80,443,8080" });
-    try std.testing.expectEqual(3, int_result.ports.len);
-    try std.testing.expectEqual(80, int_result.ports[0]);
-    try std.testing.expectEqual(443, int_result.ports[1]);
-    try std.testing.expectEqual(8080, int_result.ports[2]);
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt" });
+    try std.testing.expectEqual(1, result.files.len);
+    try std.testing.expectEqualStrings("a.txt,b.txt", result.files[0]);
 }
 
-test "slice integer values" {
+test "list integer values repeated" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { ports: []const u16 = &.{} };
+    const result = try ta.run(Args, &.{ "prog", "--ports=80", "--ports=443" });
+    try std.testing.expectEqual(2, result.ports.len);
+    try std.testing.expectEqual(80, result.ports[0]);
+    try std.testing.expectEqual(443, result.ports[1]);
+}
+
+test "list integer values" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { ports: []const u16 = &.{} };
@@ -867,19 +859,19 @@ test "slice integer values" {
     try std.testing.expectEqual(3000, result.ports[2]);
 }
 
-test "slice enum values" {
+test "list enum values" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Format = enum { json, yaml, toml };
     const Args = struct { formats: []const Format = &.{} };
-    const result = try ta.run(Args, &.{ "prog", "--formats=json,yaml,toml" });
+    const result = try ta.run(Args, &.{ "prog", "--formats=json", "--formats=yaml", "--formats=toml" });
     try std.testing.expectEqual(3, result.formats.len);
     try std.testing.expectEqual(Format.json, result.formats[0]);
     try std.testing.expectEqual(Format.yaml, result.formats[1]);
     try std.testing.expectEqual(Format.toml, result.formats[2]);
 }
 
-test "slice with default" {
+test "list with default" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { files: []const []const u8 = &.{} };
@@ -887,7 +879,7 @@ test "slice with default" {
     try std.testing.expectEqual(0, result.files.len);
 }
 
-test "slice mixed with scalar flags" {
+test "list mixed with scalar flags" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct {
@@ -903,21 +895,21 @@ test "slice mixed with scalar flags" {
     try std.testing.expectEqual(3000, result.port);
 }
 
-test "slice invalid element" {
+test "list invalid element" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct { ports: []const u16 = &.{} };
-    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--ports=80,not_a_number" });
+    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--ports=80", "--ports=bad" });
 }
 
-test "multiple slice fields" {
+test "multiple list fields" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct {
         files: []const []const u8 = &.{},
         ports: []const u16 = &.{},
     };
-    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443" });
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt", "--files=b.txt", "--ports=80", "--ports=443" });
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqualStrings("a.txt", result.files[0]);
     try std.testing.expectEqualStrings("b.txt", result.files[1]);
@@ -1100,7 +1092,7 @@ test "list fields parse correctly" {
         ports: []const u16 = &.{},
         verbose: bool = false,
     };
-    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443", "--verbose" });
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt", "--files=b.txt", "--ports=80", "--ports=443", "--verbose" });
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqual(2, result.ports.len);
     try std.testing.expectEqual(true, result.verbose);
@@ -1116,7 +1108,7 @@ test "subcommand with list fields" {
             stop: struct {},
         },
     };
-    const result = try ta.run(CLI, &.{ "prog", "--verbose", "serve", "--hosts=a.com,b.com" });
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "serve", "--hosts=a.com", "--hosts=b.com" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(2, result.command.serve.hosts.len);
 }
@@ -1146,7 +1138,7 @@ test "optional subcommand null" {
     try std.testing.expectEqual(null, result.command);
 }
 
-test "slice_lists array with non-slice and slice fields" {
+test "list_values array with non-list and list fields" {
     var ta = TestArena.init();
     defer ta.deinit();
     const Args = struct {
@@ -1154,7 +1146,7 @@ test "slice_lists array with non-slice and slice fields" {
         files: []const []const u8 = &.{},
         name: []const u8 = "default",
     };
-    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--name=test" });
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt", "--files=b.txt", "--name=test" });
     try std.testing.expectEqual(false, result.verbose);
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqualSlices(u8, result.name, "test");
