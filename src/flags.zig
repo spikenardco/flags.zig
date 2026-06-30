@@ -391,9 +391,64 @@ pub fn usage(comptime T: type) []const u8 {
     return render_usage(T);
 }
 
-/// Comptime-generated usage. Replaced with full generation in Task 4.
-fn render_usage(comptime _: type) []const u8 {
-    return "No help available. Declare `pub const help` on your type.";
+fn render_usage(comptime T: type) []const u8 {
+    comptime {
+        return switch (@typeInfo(T)) {
+            .@"struct" => generate_struct_usage(T),
+            .@"union" => generate_union_usage(T),
+            else => "",
+        };
+    }
+}
+
+fn generate_struct_usage(comptime T: type) []const u8 {
+    comptime {
+        var flags_text: []const u8 = "";
+        var cmds_text: []const u8 = "";
+        for (std.meta.fields(T)) |field| {
+            if (is_union_subcommand(field)) {
+                const SubT = unwrap_optional(field.type);
+                for (std.meta.fields(SubT)) |variant| {
+                    cmds_text = cmds_text ++ "  " ++ variant.name ++ "\n";
+                }
+            } else {
+                flags_text = flags_text ++ "  --" ++ field.name ++ "  " ++
+                    @typeName(field.type) ++ default_label(field) ++ "\n";
+            }
+        }
+        var out: []const u8 = "";
+        if (flags_text.len > 0) out = out ++ "Flags:\n" ++ flags_text;
+        if (cmds_text.len > 0) out = out ++ "Commands:\n" ++ cmds_text;
+        return out;
+    }
+}
+
+fn generate_union_usage(comptime T: type) []const u8 {
+    comptime {
+        var out: []const u8 = "Commands:\n";
+        for (std.meta.fields(T)) |field| {
+            out = out ++ "  " ++ field.name ++ "\n";
+        }
+        return out;
+    }
+}
+
+fn default_label(comptime field: std.builtin.Type.StructField) []const u8 {
+    if (@typeInfo(field.type) == .optional) return " (optional)";
+    if (is_slice_type(field.type)) return " (repeatable)";
+    if (field.defaultValue()) |d| {
+        return " (default: " ++ value_to_string(field.type, d) ++ ")";
+    }
+    return " (required)";
+}
+
+fn value_to_string(comptime T: type, comptime v: T) []const u8 {
+    return switch (@typeInfo(T)) {
+        .pointer => v,
+        .@"enum" => @tagName(v),
+        .bool => if (v) "true" else "false",
+        else => std.fmt.comptimePrint("{}", .{v}),
+    };
 }
 
 // =============================================================================
@@ -466,6 +521,58 @@ test "help requested at subcommand level uses that level" {
     };
     try ta.expect_err(error.HelpRequested, CLI, &.{ "prog", "server", "--help" });
     try std.testing.expectEqualStrings("server help", ta.diag.usage.?);
+}
+
+test "auto usage for flag struct" {
+    const Args = struct {
+        name: []const u8 = "joe",
+        port: u16 = 8080,
+        verbose: bool = false,
+        config: ?[]const u8 = null,
+        host: []const u8,
+    };
+    try std.testing.expectEqualStrings(
+        \\Flags:
+        \\  --name  []const u8 (default: joe)
+        \\  --port  u16 (default: 8080)
+        \\  --verbose  bool (default: false)
+        \\  --config  ?[]const u8 (optional)
+        \\  --host  []const u8 (required)
+        \\
+    , comptime usage(Args));
+}
+
+test "auto usage for union" {
+    const CLI = union(enum) { start: struct {}, stop: struct {} };
+    try std.testing.expectEqualStrings(
+        \\Commands:
+        \\  start
+        \\  stop
+        \\
+    , comptime usage(CLI));
+}
+
+test "auto usage with flags and commands" {
+    const CLI = struct {
+        verbose: bool = false,
+        command: union(enum) { serve: struct {}, stop: struct {} },
+    };
+    try std.testing.expectEqualStrings(
+        \\Flags:
+        \\  --verbose  bool (default: false)
+        \\Commands:
+        \\  serve
+        \\  stop
+        \\
+    , comptime usage(CLI));
+}
+
+test "pub const help overrides auto usage" {
+    const Args = struct {
+        v: bool = false,
+        pub const help = "custom";
+    };
+    try std.testing.expectEqualStrings("custom", comptime usage(Args));
 }
 
 test "auto help generation" {
