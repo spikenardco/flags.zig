@@ -1,11 +1,11 @@
 # flags.zig
 
-A type-safe command-line argument parser for Zig. Taking inspiration from **Rust clap**, and **TigerBeetle's flags** implementation, it lets you define flags using a struct or union(enum) and parses command-line arguments into it.
+A type-safe command-line argument parser for Zig. Inspired by **Rust clap** and **TigerBeetle's flags**, it lets you define flags using a struct or union(enum) and parses command-line arguments into it.
 
-- Zero runtime overhead — parsing happens at comptime where possible
-- Type safety — catch errors at compile time, not runtime
-- Idiomatic Zig — works with the grain of the language
-- Zero external dependencies
+- Zero runtime overhead. Parsing happens at comptime where possible.
+- Type safety. Catch errors at compile time, not runtime.
+- Idiomatic Zig. Works with the grain of the language.
+- Zero external dependencies.
 
 ## Features
 
@@ -13,7 +13,7 @@ A type-safe command-line argument parser for Zig. Taking inspiration from **Rust
 - [x] Struct-based argument definition
 - [x] Default values via struct fields
 - [x] Error handling for invalid/unknown flags
-- [x] Positional arguments via `positional` struct
+- [x] Positional arguments via `@"--"` marker
 - [x] Subcommands via `union(enum)`
 - [x] Repeatable list flags (`--x=a --x=b`)
 - [x] Auto-generated `--help`
@@ -191,7 +191,7 @@ command: union(enum) {
 1. **Use struct defaults** for common values
 2. **Define help** via `pub const help` declarations when you need hand-written text
 3. **Use unions** for mutually exclusive subcommands
-4. **Leverage enums** for constrained choices
+4. **Use enums** for constrained choices
 5. **Use optional types** for truly optional flags
 
 ### DON'T
@@ -215,14 +215,14 @@ The parser extracts typed values. What you do with them is your business.
 
 ## Not planned
 
-- **No short flags** — only long flags (`--flag=value`), except `-h` for help. For brevity, use `--v` instead of `-v`
-- **No custom types** — only built-in types and enums
-- **No nested slices** — slices of slices not supported (`[][]T`)
-- **No comma-separated lists** — use repeated flags (`--x=a --x=b`)
-- **No optional subcommands** — use a `default` variant
-- **Equals syntax only** — use `--name=value` not `--name value`
-- **Strict boolean values** — only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.)
-- **No subcommands + positional args** — use either subcommands or positional arguments, not both in the same struct
+- **No short flags.** Only long flags (`--flag=value`), except `-h` for help. For brevity, use `--v` instead of `-v`.
+- **No custom types.** Only built-in types and enums.
+- **No nested slices.** Slices of slices not supported (`[][]T`).
+- **No comma-separated lists.** Use repeated flags (`--x=a --x=b`).
+- **No optional subcommands.** Use a `default` variant.
+- **Equals syntax only.** Use `--name=value` not `--name value`.
+- **Strict boolean values.** Only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.).
+- **No subcommands + positional args.** Use either subcommands or positional arguments, not both in the same struct.
 
 ## Migration (from 0.1)
 
@@ -235,7 +235,7 @@ The parser extracts typed values. What you do with them is your business.
 
 ## Credits
 
-This library draws significant inspiration from two exceptional projects:
+This library draws inspiration from two projects:
 
-- [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle) — struct-based flag definitions and zero-cost abstractions
-- [Rust clap](https://github.com/clap-rs/clap) — declarative API design and derive-style patterns
+- [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle) for struct-based flag definitions and zero-cost abstractions
+- [Rust clap](https://github.com/clap-rs/clap) for declarative API design and derive-style patterns

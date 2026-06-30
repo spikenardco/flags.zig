@@ -1,5 +1,5 @@
-/// Arena-based, type-driven CLI parser with typed flags, list flags, subcommands,
-/// positional args, comptime-generated help, and structured errors via Diagnostic.
+/// Arena-based, type-driven CLI parser for typed flags, list flags, subcommands,
+/// positional args, comptime-generated help, and structured errors.
 const std = @import("std");
 
 /// Carries error context out of `parse` so the caller can render messages and
@@ -88,8 +88,8 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
         }
     }
 
-    const subcmd_idx = comptime find_subcommand_field(named_fields);
-    if (comptime subcmd_idx != null and positional_fields.len > 0) {
+    const subcommand_idx = comptime find_subcommand_field(named_fields);
+    if (comptime subcommand_idx != null and positional_fields.len > 0) {
         @compileError("subcommands and positional arguments cannot coexist in the same struct");
     }
 
@@ -166,10 +166,10 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             return error.UnexpectedArgument;
         }
 
-        if (comptime subcmd_idx) |si| {
-            const subcmd_field = named_fields[si];
-            const parsed = try dispatch_subcommand(allocator, args[i..], subcmd_field.type, diag);
-            @field(result, subcmd_field.name) = parsed;
+        if (comptime subcommand_idx) |si| {
+            const subcommand_field = named_fields[si];
+            const parsed = try dispatch_subcommand(allocator, args[i..], subcommand_field.type, diag);
+            @field(result, subcommand_field.name) = parsed;
             seen[si] = true;
             break;
         }
@@ -357,7 +357,7 @@ fn is_help_flag(arg: []const u8) bool {
 }
 
 /// Public: the usage text for a type. Uses `pub const help` if declared,
-/// otherwise the comptime-generated usage (Task 4).
+/// otherwise the comptime-generated usage text.
 pub fn usage(comptime T: type) []const u8 {
     if (@hasDecl(T, "help")) return T.help;
     return render_usage(T);
@@ -376,12 +376,12 @@ fn render_usage(comptime T: type) []const u8 {
 fn generate_struct_usage(comptime T: type) []const u8 {
     comptime {
         var flags_text: []const u8 = "";
-        var cmds_text: []const u8 = "";
+        var commands_text: []const u8 = "";
         for (std.meta.fields(T)) |field| {
             if (std.mem.eql(u8, field.name, "--")) continue;
             if (is_subcommand_field(field)) {
                 for (std.meta.fields(field.type)) |variant| {
-                    cmds_text = cmds_text ++ "  " ++ variant.name ++ "\n";
+                    commands_text = commands_text ++ "  " ++ variant.name ++ "\n";
                 }
             } else {
                 flags_text = flags_text ++ "  --" ++ field.name ++ "  " ++
@@ -390,7 +390,7 @@ fn generate_struct_usage(comptime T: type) []const u8 {
         }
         var out: []const u8 = "";
         if (flags_text.len > 0) out = out ++ "Flags:\n" ++ flags_text;
-        if (cmds_text.len > 0) out = out ++ "Commands:\n" ++ cmds_text;
+        if (commands_text.len > 0) out = out ++ "Commands:\n" ++ commands_text;
         return out;
     }
 }
