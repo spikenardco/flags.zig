@@ -109,7 +109,11 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
         if (is_help_arg(arg)) print_help(T);
 
         if (std.mem.eql(u8, arg, "--")) {
-            if (positional_fields.len == 0) return error.UnexpectedArgument;
+            if (positional_fields.len == 0) {
+                diag.token = arg;
+                diag.message = "unexpected argument";
+                return error.UnexpectedArgument;
+            }
             positional_only = true;
             continue;
         }
@@ -131,26 +135,46 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
                     found = true;
 
                     if (comptime is_slice_type(field.type)) {
-                        const fv = flag_value orelse return error.MissingValue;
+                        const fv = flag_value orelse {
+                            diag.token = arg;
+                            diag.message = "missing value for flag";
+                            return error.MissingValue;
+                        };
                         var iter = std.mem.splitScalar(u8, fv, ',');
                         while (iter.next()) |part| {
                             try slice_lists[field_index].append(allocator, part);
                         }
                         seen[field_index] = true;
                     } else {
-                        if (seen[field_index]) return error.DuplicateFlag;
+                        if (seen[field_index]) {
+                            diag.token = arg;
+                            diag.message = "duplicate flag";
+                            return error.DuplicateFlag;
+                        }
                         seen[field_index] = true;
-                        @field(result, field.name) = try parse_value(field.type, flag_value);
+                        @field(result, field.name) = parse_value(field.type, flag_value) catch |e| {
+                            diag.token = arg;
+                            diag.message = "invalid value";
+                            return e;
+                        };
                     }
                     break;
                 }
             }
 
-            if (!found) return error.UnknownFlag;
+            if (!found) {
+                diag.token = arg;
+                diag.message = "unknown flag";
+                return error.UnknownFlag;
+            }
             continue;
         }
 
-        if (!positional_only and std.mem.startsWith(u8, arg, "-")) return error.UnexpectedArgument;
+        if (!positional_only and std.mem.startsWith(u8, arg, "-")) {
+            diag.token = arg;
+            diag.message = "unexpected argument";
+            return error.UnexpectedArgument;
+        }
 
         if (comptime subcmd_idx) |si| {
             const subcmd_field = named_fields[si];
@@ -165,13 +189,25 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
             break;
         }
 
-        if (positional_fields.len == 0) return error.UnexpectedArgument;
+        if (positional_fields.len == 0) {
+            diag.token = arg;
+            diag.message = "unexpected argument";
+            return error.UnexpectedArgument;
+        }
 
-        if (positional_index >= positional_fields.len) return error.TooManyPositionals;
+        if (positional_index >= positional_fields.len) {
+            diag.token = arg;
+            diag.message = "too many positional arguments";
+            return error.TooManyPositionals;
+        }
 
         inline for (positional_fields, 0..) |field, pi| {
             if (pi == positional_index) {
-                @field(result, field.name) = try parse_value(field.type, arg);
+                @field(result, field.name) = parse_value(field.type, arg) catch |e| {
+                    diag.token = arg;
+                    diag.message = "invalid value";
+                    return e;
+                };
             }
         }
         positional_index += 1;
@@ -270,7 +306,11 @@ fn parse_subcommand(
             }
             break :blk try parse_commands(allocator, args, field.type, diag);
         },
-        .void => if (args.len > 0) error.UnexpectedArgument else {},
+        .void => if (args.len > 0) blk: {
+            diag.token = args[0];
+            diag.message = "unexpected argument";
+            break :blk error.UnexpectedArgument;
+        } else {},
         else => @compileError("subcommand types must be struct, union(enum), or void"),
     };
 }
@@ -291,6 +331,8 @@ fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, compti
         }
     }
 
+    diag.token = arg;
+    diag.message = "unknown subcommand";
     return error.UnknownSubcommand;
 }
 
@@ -367,6 +409,32 @@ const TestArena = struct {
         try std.testing.expectError(expected, self.run(T, argv));
     }
 };
+
+test "diagnostic names unknown flag" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.UnknownFlag, Args, &.{ "prog", "--prot=80" });
+    try std.testing.expectEqualStrings("--prot=80", ta.diag.token.?);
+    try std.testing.expectEqualStrings("unknown flag", ta.diag.message.?);
+}
+
+test "diagnostic names invalid value" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--port=nope" });
+    try std.testing.expectEqualStrings("--port=nope", ta.diag.token.?);
+}
+
+test "diagnostic names unknown subcommand" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) { start: struct {}, stop: struct {} };
+    try ta.expect_err(error.UnknownSubcommand, CLI, &.{ "prog", "restart" });
+    try std.testing.expectEqualStrings("restart", ta.diag.token.?);
+    try std.testing.expectEqualStrings("unknown subcommand", ta.diag.message.?);
+}
 
 test "auto help generation" {
     const Args = struct {
