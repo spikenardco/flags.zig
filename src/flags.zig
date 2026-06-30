@@ -1,52 +1,55 @@
 /// Comptime-first CLI parser with typed flags, positional args, subcommands, and slices.
 const std = @import("std");
 
+/// Carries error context out of `parse` so the caller can render messages and
+/// usage. `parse` never prints and never exits; it populates this instead.
+pub const Diagnostic = struct {
+    /// The offending argument for a parse error (e.g. "--prot"), if any.
+    token: ?[]const u8 = null,
+    /// Human-readable message for a parse error, if any.
+    message: ?[]const u8 = null,
+    /// Comptime-generated usage text, set on error.HelpRequested.
+    usage: ?[]const u8 = null,
+
+    /// Print usage (if set) or the error message to stderr. Convenience only.
+    pub fn report(self: Diagnostic) void {
+        if (self.usage) |u| {
+            std.debug.print("{s}\n", .{u});
+            return;
+        }
+        if (self.message) |m| {
+            if (self.token) |t| {
+                std.debug.print("error: {s}: {s}\n", .{ m, t });
+            } else {
+                std.debug.print("error: {s}\n", .{m});
+            }
+        }
+    }
+};
+
 /// Parse args into a struct (single command) or union(enum) (subcommands).
 ///
 /// Caller passes full argv; the parser skips argv[0] (the program name).
 ///
 /// Allocator is used for slice field allocation; caller owns returned memory.
-pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type) !T {
+pub fn parse(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    comptime T: type,
+    diag: *Diagnostic,
+) !T {
     if (args.len == 0) return error.EmptyArgs;
     const trimmed = args[1..];
     const info = @typeInfo(T);
     switch (info) {
-        .@"struct" => return parse_struct(allocator, trimmed, T),
+        .@"struct" => return parse_struct(allocator, trimmed, T, diag),
         .@"union" => {
             if (info.@"union".tag_type == null) {
                 @compileError("Args must be a union(enum) to use subcommands");
             }
-            return parse_commands(allocator, trimmed, T);
+            return parse_commands(allocator, trimmed, T, diag);
         },
         else => @compileError("Args must be a struct or union(enum)"),
-    }
-}
-
-/// Free all memory allocated by `parse` for the given result.
-///
-/// Recursively frees slice fields in structs and the active union variant.
-/// Usage: `defer flags.deinit(allocator, result);`
-pub fn deinit(allocator: std.mem.Allocator, value: anytype) void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .@"struct" => {
-            inline for (std.meta.fields(T)) |field| {
-                if (comptime is_slice_type(field.type)) {
-                    allocator.free(@field(value, field.name));
-                } else {
-                    deinit(allocator, @field(value, field.name));
-                }
-            }
-        },
-        .@"union" => |u| {
-            if (u.tag_type != null) {
-                switch (value) {
-                    inline else => |v| deinit(allocator, v),
-                }
-            }
-        },
-        .optional => if (value) |v| deinit(allocator, v),
-        else => {},
     }
 }
 
@@ -70,7 +73,7 @@ fn separator_index(comptime fields: []const std.builtin.Type.StructField) ?usize
 }
 
 /// Parse a struct schema of named flags and optional positional args.
-fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type) !T {
+fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
     const marker_idx = comptime separator_index(fields);
     const named_fields = if (marker_idx) |idx| fields[0..idx] else fields;
@@ -89,22 +92,13 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
     var result: T = undefined;
     var seen = std.mem.zeroes([named_fields.len]bool);
-    var slice_assigned = std.mem.zeroes([named_fields.len]bool);
     var positional_index: usize = 0;
     var positional_only = false;
 
-    // Initialize accumulators for slice fields.
     var slice_lists = std.mem.zeroes([named_fields.len]std.ArrayList([]const u8));
     inline for (named_fields, 0..) |field, fi| {
         if (comptime is_slice_type(field.type)) {
             slice_lists[fi] = .empty;
-        }
-    }
-    defer {
-        inline for (named_fields, 0..) |field, fi| {
-            if (comptime is_slice_type(field.type)) {
-                slice_lists[fi].deinit(allocator);
-            }
         }
     }
 
@@ -116,7 +110,6 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
         if (std.mem.eql(u8, arg, "--")) {
             if (positional_fields.len == 0) return error.UnexpectedArgument;
-
             positional_only = true;
             continue;
         }
@@ -139,7 +132,6 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
 
                     if (comptime is_slice_type(field.type)) {
                         const fv = flag_value orelse return error.MissingValue;
-                        // --files=a.txt,b.txt or --files=a.txt
                         var iter = std.mem.splitScalar(u8, fv, ',');
                         while (iter.next()) |part| {
                             try slice_lists[field_index].append(allocator, part);
@@ -147,7 +139,6 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
                         seen[field_index] = true;
                     } else {
                         if (seen[field_index]) return error.DuplicateFlag;
-
                         seen[field_index] = true;
                         @field(result, field.name) = try parse_value(field.type, flag_value);
                     }
@@ -164,7 +155,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
         if (comptime subcmd_idx) |si| {
             const subcmd_field = named_fields[si];
             const SubT = unwrap_optional(subcmd_field.type);
-            const parsed = try parse_commands(allocator, args[i..], SubT);
+            const parsed = try parse_commands(allocator, args[i..], SubT, diag);
             if (comptime @typeInfo(subcmd_field.type) == .optional) {
                 @field(result, subcmd_field.name) = @as(subcmd_field.type, parsed);
             } else {
@@ -174,9 +165,7 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
             break;
         }
 
-        if (positional_fields.len == 0) {
-            return error.UnexpectedArgument;
-        }
+        if (positional_fields.len == 0) return error.UnexpectedArgument;
 
         if (positional_index >= positional_fields.len) return error.TooManyPositionals;
 
@@ -187,22 +176,6 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
         }
         positional_index += 1;
         positional_only = true;
-    }
-
-    errdefer {
-        if (comptime subcmd_idx) |si| {
-            if (seen[si]) {
-                deinit(allocator, @field(result, named_fields[si].name));
-            }
-        }
-
-        inline for (named_fields, 0..) |field, fi| {
-            if (comptime is_slice_type(field.type)) {
-                if (slice_assigned[fi]) {
-                    allocator.free(@field(result, field.name));
-                }
-            }
-        }
     }
 
     // Build slices and apply defaults.
@@ -216,12 +189,10 @@ fn parse_struct(allocator: std.mem.Allocator, args: []const []const u8, comptime
                 const items = slice_lists[field_index].items;
                 const child = comptime @typeInfo(field.type).pointer.child;
                 const typed = try allocator.alloc(child, items.len);
-                errdefer allocator.free(typed);
                 for (items, 0..) |raw, j| {
                     typed[j] = try parse_scalar(child, raw);
                 }
                 @field(result, field.name) = typed;
-                slice_assigned[field_index] = true;
             } else {
                 const child = comptime @typeInfo(field.type).pointer.child;
                 if (field.defaultValue()) |default| {
@@ -288,15 +259,16 @@ fn parse_subcommand(
     allocator: std.mem.Allocator,
     comptime field: std.builtin.Type.UnionField,
     args: []const []const u8,
+    diag: *Diagnostic,
 ) !field.type {
     const subcommand_info = @typeInfo(field.type);
     return switch (subcommand_info) {
-        .@"struct" => try parse_struct(allocator, args, field.type),
+        .@"struct" => try parse_struct(allocator, args, field.type, diag),
         .@"union" => blk: {
             if (subcommand_info.@"union".tag_type == null) {
                 @compileError("subcommand types must be struct or union(enum)");
             }
-            break :blk try parse_commands(allocator, args, field.type);
+            break :blk try parse_commands(allocator, args, field.type, diag);
         },
         .void => if (args.len > 0) error.UnexpectedArgument else {},
         else => @compileError("subcommand types must be struct, union(enum), or void"),
@@ -304,7 +276,7 @@ fn parse_subcommand(
 }
 
 /// Match and parse the first arg as a subcommand name, then parse the rest.
-fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type) !T {
+fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
 
     if (args.len == 0) return error.MissingSubcommand;
@@ -314,7 +286,7 @@ fn parse_commands(allocator: std.mem.Allocator, args: []const []const u8, compti
 
     inline for (fields) |field| {
         if (std.mem.eql(u8, arg, field.name)) {
-            const parsed = try parse_subcommand(allocator, field, args[1..]);
+            const parsed = try parse_subcommand(allocator, field, args[1..], diag);
             return @unionInit(T, field.name, parsed);
         }
     }
@@ -371,13 +343,30 @@ fn print_help(comptime T: type) void {
     } else {
         std.debug.print("No help available. Declare `pub const help` on your type.\n", .{});
     }
-
     std.process.exit(0);
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+const TestArena = struct {
+    arena: std.heap.ArenaAllocator,
+    diag: Diagnostic = .{},
+
+    fn init() TestArena {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    }
+    fn deinit(self: *TestArena) void {
+        self.arena.deinit();
+    }
+    fn run(self: *TestArena, comptime T: type, argv: []const []const u8) !T {
+        return parse(self.arena.allocator(), argv, T, &self.diag);
+    }
+    fn expect_err(self: *TestArena, expected: anyerror, comptime T: type, argv: []const []const u8) !void {
+        try std.testing.expectError(expected, self.run(T, argv));
+    }
+};
 
 test "auto help generation" {
     const Args = struct {
@@ -397,24 +386,22 @@ test "auto help generation" {
 }
 
 test "bare argument rejected without positionals" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        name: []const u8 = "joe",
-    };
-
-    try std.testing.expectError(error.UnexpectedArgument, parse(allocator, &.{ "prog", "name=jack" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { name: []const u8 = "joe" };
+    try ta.expect_err(error.UnexpectedArgument, Args, &.{ "prog", "name=jack" });
 }
 
 test "parse defaults" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         name: []const u8 = "joe",
         active: bool = false,
         port: u16 = 5000,
         rate: f32 = 1.0,
     };
-
-    const flags = try parse(allocator, &.{"prog"}, Args);
+    const flags = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqualStrings("joe", flags.name);
     try std.testing.expectEqual(false, flags.active);
     try std.testing.expectEqual(5000, flags.port);
@@ -422,15 +409,15 @@ test "parse defaults" {
 }
 
 test "parse primitives" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         name: []const u8 = "default",
         port: u16 = 8080,
         rate: f32 = 1.0,
         active: bool = false,
     };
-
-    const flags = try parse(allocator, &.{ "prog", "--name=test", "--port=9090", "--rate=2.5", "--active" }, Args);
+    const flags = try ta.run(Args, &.{ "prog", "--name=test", "--port=9090", "--rate=2.5", "--active" });
     try std.testing.expectEqualStrings("test", flags.name);
     try std.testing.expectEqual(9090, flags.port);
     try std.testing.expectEqual(2.5, flags.rate);
@@ -438,263 +425,202 @@ test "parse primitives" {
 }
 
 test "parse enum" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Format = enum { json, yaml, toml };
-    const Args = struct {
-        format: Format = .json,
-    };
-
-    const flags = try parse(allocator, &.{ "prog", "--format=yaml" }, Args);
+    const Args = struct { format: Format = .json };
+    const flags = try ta.run(Args, &.{ "prog", "--format=yaml" });
     try std.testing.expectEqual(Format.yaml, flags.format);
 }
 
 test "parse enum with default" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Format = enum { json, yaml, toml };
-    const Args = struct {
-        format: Format = .json,
-    };
-
-    const flags = try parse(allocator, &.{"prog"}, Args);
+    const Args = struct { format: Format = .json };
+    const flags = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqual(Format.json, flags.format);
 }
 
 test "parse optional types" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         config: ?[]const u8 = null,
         count: ?u32 = null,
         verbose: ?bool = null,
     };
 
-    const flags1 = try parse(allocator, &.{"prog"}, Args);
+    const flags1 = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqual(null, flags1.config);
     try std.testing.expectEqual(null, flags1.count);
     try std.testing.expectEqual(null, flags1.verbose);
 
-    const flags2 = try parse(allocator, &.{ "prog", "--config=/path/to/config", "--count=42", "--verbose" }, Args);
+    const flags2 = try ta.run(Args, &.{ "prog", "--config=/path/to/config", "--count=42", "--verbose" });
     try std.testing.expectEqualStrings("/path/to/config", flags2.config.?);
     try std.testing.expectEqual(42, flags2.count.?);
     try std.testing.expectEqual(true, flags2.verbose.?);
 }
 
 test "parse boolean formats" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        flag: bool = false,
-    };
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { flag: bool = false };
 
-    const flags1 = try parse(allocator, &.{ "prog", "--flag" }, Args);
+    const flags1 = try ta.run(Args, &.{ "prog", "--flag" });
     try std.testing.expectEqual(true, flags1.flag);
 
-    const flags2 = try parse(allocator, &.{ "prog", "--flag=true" }, Args);
+    const flags2 = try ta.run(Args, &.{ "prog", "--flag=true" });
     try std.testing.expectEqual(true, flags2.flag);
 
-    const flags3 = try parse(allocator, &.{ "prog", "--flag=false" }, Args);
+    const flags3 = try ta.run(Args, &.{ "prog", "--flag=false" });
     try std.testing.expectEqual(false, flags3.flag);
 }
 
 test "parse subcommand" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = union(enum) {
-        start: struct {
-            host: []const u8 = "localhost",
-            port: u16 = 8080,
-        },
-        stop: struct {
-            force: bool = false,
-        },
+        start: struct { host: []const u8 = "localhost", port: u16 = 8080 },
+        stop: struct { force: bool = false },
     };
 
-    const result1 = try parse(allocator, &.{ "prog", "start", "--host=0.0.0.0", "--port=3000" }, CLI);
+    const result1 = try ta.run(CLI, &.{ "prog", "start", "--host=0.0.0.0", "--port=3000" });
     try std.testing.expectEqualStrings("0.0.0.0", result1.start.host);
     try std.testing.expectEqual(3000, result1.start.port);
 
-    const result2 = try parse(allocator, &.{ "prog", "stop", "--force" }, CLI);
+    const result2 = try ta.run(CLI, &.{ "prog", "stop", "--force" });
     try std.testing.expectEqual(true, result2.stop.force);
 }
 
 test "parse subcommand with defaults" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = union(enum) {
-        start: struct {
-            host: []const u8 = "localhost",
-            port: u16 = 8080,
-        },
+        start: struct { host: []const u8 = "localhost", port: u16 = 8080 },
         stop: struct {},
     };
-
-    const result = try parse(allocator, &.{ "prog", "start" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "start" });
     try std.testing.expectEqualStrings("localhost", result.start.host);
     try std.testing.expectEqual(8080, result.start.port);
 }
 
 test "void subcommand variant" {
-    const allocator = std.testing.allocator;
-    const CLI = union(enum) {
-        start: struct {
-            port: u16 = 8080,
-        },
-        stop: void,
-    };
-
-    const result = try parse(allocator, &.{ "prog", "stop" }, CLI);
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) { start: struct { port: u16 = 8080 }, stop: void };
+    const result = try ta.run(CLI, &.{ "prog", "stop" });
     try std.testing.expectEqual(CLI.stop, result);
 
-    const result2 = try parse(allocator, &.{ "prog", "start" }, CLI);
+    const result2 = try ta.run(CLI, &.{ "prog", "start" });
     try std.testing.expectEqual(8080, result2.start.port);
 }
 
 test "void subcommand variant with extra args" {
-    const allocator = std.testing.allocator;
-    const CLI = union(enum) {
-        start: struct { port: u16 = 8080 },
-        stop: void,
-    };
-
-    try std.testing.expectError(error.UnexpectedArgument, parse(allocator, &.{ "prog", "stop", "--force" }, CLI));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) { start: struct { port: u16 = 8080 }, stop: void };
+    try ta.expect_err(error.UnexpectedArgument, CLI, &.{ "prog", "stop", "--force" });
 }
 
 test "void subcommand variant rejects help arg" {
-    const allocator = std.testing.allocator;
-    const CLI = union(enum) {
-        start: struct { port: u16 = 8080 },
-        stop: void,
-    };
-
-    try std.testing.expectError(error.UnexpectedArgument, parse(allocator, &.{ "prog", "stop", "--help" }, CLI));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) { start: struct { port: u16 = 8080 }, stop: void };
+    try ta.expect_err(error.UnexpectedArgument, CLI, &.{ "prog", "stop", "--help" });
 }
 
 test "missing subcommand" {
-    const allocator = std.testing.allocator;
-    const CLI = union(enum) {
-        start: struct {
-            host: []const u8 = "localhost",
-        },
-        stop: struct {
-            force: bool = false,
-        },
-    };
-
-    try std.testing.expectError(error.MissingSubcommand, parse(allocator, &.{"prog"}, CLI));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = union(enum) { start: struct { host: []const u8 = "localhost" }, stop: struct { force: bool = false } };
+    try ta.expect_err(error.MissingSubcommand, CLI, &.{"prog"});
 }
 
 test "unknown subcommand" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: union(enum) {
-            start: struct {
-                host: []const u8 = "localhost",
-            },
-            stop: struct {
-                force: bool = false,
-            },
-        },
+        command: union(enum) { start: struct { host: []const u8 = "localhost" }, stop: struct { force: bool = false } },
     };
-
-    try std.testing.expectError(error.UnknownSubcommand, parse(allocator, &.{ "prog", "--verbose", "restart" }, CLI));
+    try ta.expect_err(error.UnknownSubcommand, CLI, &.{ "prog", "--verbose", "restart" });
 }
 
 test "duplicate flag" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        port: u16 = 8080,
-    };
-
-    try std.testing.expectError(error.DuplicateFlag, parse(allocator, &.{ "prog", "--port=8080", "--port=9090" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.DuplicateFlag, Args, &.{ "prog", "--port=8080", "--port=9090" });
 }
 
 test "missing value" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        name: []const u8,
-    };
-
-    try std.testing.expectError(error.MissingValue, parse(allocator, &.{ "prog", "--name" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { name: []const u8 };
+    try ta.expect_err(error.MissingValue, Args, &.{ "prog", "--name" });
 }
 
 test "invalid enum value" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Format = enum { json, yaml, toml };
-    const Args = struct {
-        format: Format = .json,
-    };
-
-    try std.testing.expectError(error.InvalidValue, parse(allocator, &.{ "prog", "--format=xml" }, Args));
+    const Args = struct { format: Format = .json };
+    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--format=xml" });
 }
 
 test "invalid int value" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        port: u16 = 8080,
-    };
-
-    try std.testing.expectError(error.InvalidValue, parse(allocator, &.{ "prog", "--port=not-a-number" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--port=not-a-number" });
 }
 
 test "no args provided" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        port: u16 = 8080,
-    };
-
-    try std.testing.expectError(error.EmptyArgs, parse(allocator, &.{}, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.EmptyArgs, Args, &.{});
 }
 
 test "missing required flag" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        name: []const u8,
-    };
-
-    try std.testing.expectError(error.MissingRequiredFlag, parse(allocator, &.{"prog"}, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { name: []const u8 };
+    try ta.expect_err(error.MissingRequiredFlag, Args, &.{"prog"});
 }
 
 test "complex subcommand structure" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = union(enum) {
         server: union(enum) {
-            start: struct {
-                host: []const u8 = "0.0.0.0",
-                port: u16 = 8080,
-            },
-            stop: struct {
-                force: bool = false,
-            },
+            start: struct { host: []const u8 = "0.0.0.0", port: u16 = 8080 },
+            stop: struct { force: bool = false },
             pub const help = "Server commands";
         },
-        client: struct {
-            url: []const u8,
-            timeout: u32 = 30,
-        },
+        client: struct { url: []const u8, timeout: u32 = 30 },
     };
 
-    const result = try parse(allocator, &.{ "prog", "server", "start", "--port=9090" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "server", "start", "--port=9090" });
     try std.testing.expectEqualStrings("0.0.0.0", result.server.start.host);
     try std.testing.expectEqual(9090, result.server.start.port);
 }
 
 test "unexpected argument error" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        port: u16 = 8080,
-    };
-
-    try std.testing.expectError(error.UnexpectedArgument, parse(allocator, &.{ "prog", "--port=8080", "extra" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { port: u16 = 8080 };
+    try ta.expect_err(error.UnexpectedArgument, Args, &.{ "prog", "--port=8080", "extra" });
 }
 
 // --- Slice tests ---
 
 test "slice repeated flags" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-    };
-
-    const result = try parse(allocator, &.{ "prog", "--files=a.txt", "--files=b.txt", "--files=c.txt" }, Args);
-    defer deinit(allocator, result);
-
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { files: []const []const u8 = &.{} };
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt", "--files=b.txt", "--files=c.txt" });
     try std.testing.expectEqual(3, result.files.len);
     try std.testing.expectEqualStrings("a.txt", result.files[0]);
     try std.testing.expectEqualStrings("b.txt", result.files[1]);
@@ -702,30 +628,21 @@ test "slice repeated flags" {
 }
 
 test "slice comma separated" {
-    const allocator = std.testing.allocator;
-
-    const StringArgs = struct {
-        files: []const []const u8 = &[_][]const u8{},
-    };
-    const str_result = try parse(allocator, &.{ "prog", "--files=a.txt,b.txt,c.txt" }, StringArgs);
-    defer deinit(allocator, str_result);
-
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { files: []const []const u8 = &.{} };
+    const str_result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt,c.txt" });
     try std.testing.expectEqual(3, str_result.files.len);
     try std.testing.expectEqualStrings("a.txt", str_result.files[0]);
     try std.testing.expectEqualStrings("b.txt", str_result.files[1]);
     try std.testing.expectEqualStrings("c.txt", str_result.files[2]);
 
-    const single_str_result = try parse(allocator, &.{ "prog", "--files=single.txt" }, StringArgs);
-    defer deinit(allocator, single_str_result);
+    const single_str_result = try ta.run(Args, &.{ "prog", "--files=single.txt" });
     try std.testing.expectEqual(1, single_str_result.files.len);
     try std.testing.expectEqualStrings("single.txt", single_str_result.files[0]);
 
-    const IntArgs = struct {
-        ports: []const u16 = &[_]u16{},
-    };
-    const int_result = try parse(allocator, &.{ "prog", "--ports=80,443,8080" }, IntArgs);
-    defer deinit(allocator, int_result);
-
+    const IntArgs = struct { ports: []const u16 = &.{} };
+    const int_result = try ta.run(IntArgs, &.{ "prog", "--ports=80,443,8080" });
     try std.testing.expectEqual(3, int_result.ports.len);
     try std.testing.expectEqual(80, int_result.ports[0]);
     try std.testing.expectEqual(443, int_result.ports[1]);
@@ -733,14 +650,10 @@ test "slice comma separated" {
 }
 
 test "slice integer values" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        ports: []const u16 = &[_]u16{},
-    };
-
-    const result = try parse(allocator, &.{ "prog", "--ports=8080", "--ports=9090", "--ports=3000" }, Args);
-    defer deinit(allocator, result);
-
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { ports: []const u16 = &.{} };
+    const result = try ta.run(Args, &.{ "prog", "--ports=8080", "--ports=9090", "--ports=3000" });
     try std.testing.expectEqual(3, result.ports.len);
     try std.testing.expectEqual(8080, result.ports[0]);
     try std.testing.expectEqual(9090, result.ports[1]);
@@ -748,15 +661,11 @@ test "slice integer values" {
 }
 
 test "slice enum values" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Format = enum { json, yaml, toml };
-    const Args = struct {
-        formats: []const Format = &[_]Format{},
-    };
-
-    const result = try parse(allocator, &.{ "prog", "--formats=json,yaml,toml" }, Args);
-    defer deinit(allocator, result);
-
+    const Args = struct { formats: []const Format = &.{} };
+    const result = try ta.run(Args, &.{ "prog", "--formats=json,yaml,toml" });
     try std.testing.expectEqual(3, result.formats.len);
     try std.testing.expectEqual(Format.json, result.formats[0]);
     try std.testing.expectEqual(Format.yaml, result.formats[1]);
@@ -764,28 +673,22 @@ test "slice enum values" {
 }
 
 test "slice with default" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-    };
-
-    const result = try parse(allocator, &.{"prog"}, Args);
-    defer deinit(allocator, result);
-
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { files: []const []const u8 = &.{} };
+    const result = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqual(0, result.files.len);
 }
 
 test "slice mixed with scalar flags" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
+        files: []const []const u8 = &.{},
         verbose: bool = false,
         port: u16 = 8080,
     };
-
-    const result = try parse(allocator, &.{ "prog", "--files=a.txt", "--verbose", "--files=b.txt", "--port=3000" }, Args);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt", "--verbose", "--files=b.txt", "--port=3000" });
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqualStrings("a.txt", result.files[0]);
     try std.testing.expectEqualStrings("b.txt", result.files[1]);
@@ -794,24 +697,20 @@ test "slice mixed with scalar flags" {
 }
 
 test "slice invalid element" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        ports: []const u16 = &[_]u16{},
-    };
-
-    try std.testing.expectError(error.InvalidValue, parse(allocator, &.{ "prog", "--ports=80,not_a_number" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { ports: []const u16 = &.{} };
+    try ta.expect_err(error.InvalidValue, Args, &.{ "prog", "--ports=80,not_a_number" });
 }
 
 test "multiple slice fields" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-        ports: []const u16 = &[_]u16{},
+        files: []const []const u8 = &.{},
+        ports: []const u16 = &.{},
     };
-
-    const result = try parse(allocator, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443" }, Args);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443" });
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqualStrings("a.txt", result.files[0]);
     try std.testing.expectEqualStrings("b.txt", result.files[1]);
@@ -821,22 +720,18 @@ test "multiple slice fields" {
 }
 
 test "global flags with subcommand" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
         config: ?[]const u8 = null,
         command: union(enum) {
-            serve: struct {
-                host: []const u8 = "0.0.0.0",
-                port: u16 = 8080,
-            },
-            migrate: struct {
-                dry_run: bool = false,
-            },
+            serve: struct { host: []const u8 = "0.0.0.0", port: u16 = 8080 },
+            migrate: struct { dry_run: bool = false },
         },
     };
 
-    const result = try parse(allocator, &.{ "prog", "--verbose", "--config=app.toml", "serve", "--port=3000" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "--config=app.toml", "serve", "--port=3000" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqualStrings("app.toml", result.config.?);
     try std.testing.expectEqualStrings("0.0.0.0", result.command.serve.host);
@@ -844,69 +739,51 @@ test "global flags with subcommand" {
 }
 
 test "subcommand with defaults and global flags" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: union(enum) {
-            serve: struct {
-                host: []const u8 = "localhost",
-                port: u16 = 8080,
-            },
-            stop: struct {},
-        },
+        command: union(enum) { serve: struct { host: []const u8 = "localhost", port: u16 = 8080 }, stop: struct {} },
     };
-
-    const result = try parse(allocator, &.{ "prog", "serve" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "serve" });
     try std.testing.expectEqual(false, result.verbose);
     try std.testing.expectEqualStrings("localhost", result.command.serve.host);
     try std.testing.expectEqual(8080, result.command.serve.port);
 }
 
 test "required subcommand missing" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: union(enum) {
-            serve: struct { port: u16 = 8080 },
-            migrate: struct { dry_run: bool = false },
-        },
+        command: union(enum) { serve: struct { port: u16 = 8080 }, migrate: struct { dry_run: bool = false } },
     };
-
-    try std.testing.expectError(error.MissingSubcommand, parse(allocator, &.{"prog"}, CLI));
-    try std.testing.expectError(error.MissingSubcommand, parse(allocator, &.{ "prog", "--verbose" }, CLI));
+    try ta.expect_err(error.MissingSubcommand, CLI, &.{"prog"});
+    try ta.expect_err(error.MissingSubcommand, CLI, &.{ "prog", "--verbose" });
 }
 
 test "optional subcommand not given" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: ?union(enum) {
-            serve: struct { port: u16 = 8080 },
-        } = null,
+        command: ?union(enum) { serve: struct { port: u16 = 8080 } } = null,
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "--verbose" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(null, result.command);
 }
 
 test "subcommand with nested union" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
         command: union(enum) {
-            server: union(enum) {
-                start: struct {
-                    port: u16 = 8080,
-                },
-                stop: struct {
-                    force: bool = false,
-                },
-            },
+            server: union(enum) { start: struct { port: u16 = 8080 }, stop: struct { force: bool = false } },
         },
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose", "server", "start", "--port=3000" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "server", "start", "--port=3000" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(3000, result.command.server.start.port);
 }
@@ -914,93 +791,80 @@ test "subcommand with nested union" {
 // --- Positional tests ---
 
 test "positional basic" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         verbose: bool = false,
         @"--": void,
         input: []const u8,
         output: []const u8 = "out.txt",
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose", "main.zig" }, Args);
+    const result = try ta.run(Args, &.{ "prog", "--verbose", "main.zig" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqualStrings("main.zig", result.input);
     try std.testing.expectEqualStrings("out.txt", result.output);
 }
 
 test "positional multiple" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         @"--": void,
         input: []const u8,
         output: []const u8 = "out.txt",
     };
-
-    const result = try parse(allocator, &.{ "prog", "main.zig", "build.bin" }, Args);
+    const result = try ta.run(Args, &.{ "prog", "main.zig", "build.bin" });
     try std.testing.expectEqualStrings("main.zig", result.input);
     try std.testing.expectEqualStrings("build.bin", result.output);
 }
 
 test "positional with explicit separator" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
         verbose: bool = false,
         @"--": void,
         input: []const u8,
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose", "--", "main.zig" }, Args);
+    const result = try ta.run(Args, &.{ "prog", "--verbose", "--", "main.zig" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqualStrings("main.zig", result.input);
 }
 
 test "positional with negative and dash-prefixed values after separator" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
 
-    const ArgsInt = struct {
-        @"--": void,
-        value: i32,
-    };
-    const result_int = try parse(allocator, &.{ "prog", "--", "-5" }, ArgsInt);
+    const ArgsInt = struct { @"--": void, value: i32 };
+    const result_int = try ta.run(ArgsInt, &.{ "prog", "--", "-5" });
     try std.testing.expectEqual(-5, result_int.value);
 
-    const ArgsFloat = struct {
-        @"--": void,
-        value: f64,
-    };
-    const result_float = try parse(allocator, &.{ "prog", "--", "-3.14" }, ArgsFloat);
+    const ArgsFloat = struct { @"--": void, value: f64 };
+    const result_float = try ta.run(ArgsFloat, &.{ "prog", "--", "-3.14" });
     try std.testing.expectEqual(-3.14, result_float.value);
 
-    const ArgsString = struct {
-        @"--": void,
-        name: []const u8,
-    };
-    const result_string = try parse(allocator, &.{ "prog", "--", "-filename" }, ArgsString);
+    const ArgsString = struct { @"--": void, name: []const u8 };
+    const result_string = try ta.run(ArgsString, &.{ "prog", "--", "-filename" });
     try std.testing.expectEqualStrings("-filename", result_string.name);
 }
 
 test "positional missing required" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        @"--": void,
-        input: []const u8,
-    };
-
-    try std.testing.expectError(error.MissingRequiredPositional, parse(allocator, &.{"prog"}, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { @"--": void, input: []const u8 };
+    try ta.expect_err(error.MissingRequiredPositional, Args, &.{"prog"});
 }
 
 test "positional too many" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        @"--": void,
-        input: []const u8,
-    };
-
-    try std.testing.expectError(error.TooManyPositionals, parse(allocator, &.{ "prog", "a.zig", "b.zig" }, Args));
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { @"--": void, input: []const u8 };
+    try ta.expect_err(error.TooManyPositionals, Args, &.{ "prog", "a.zig", "b.zig" });
 }
 
 test "positional inside subcommand" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
         command: union(enum) {
@@ -1012,128 +876,78 @@ test "positional inside subcommand" {
             },
         },
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose", "compile", "--optimize", "main.zig" }, CLI);
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "compile", "--optimize", "main.zig" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(true, result.command.compile.optimize);
     try std.testing.expectEqualStrings("main.zig", result.command.compile.input);
     try std.testing.expectEqualStrings("a.out", result.command.compile.output);
 }
 
-// --- Deinit tests ---
+// --- List (ex-deinit) tests ---
 
-test "deinit frees struct with slices" {
-    const allocator = std.testing.allocator;
+test "list fields parse correctly" {
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-        ports: []const u16 = &[_]u16{},
+        files: []const []const u8 = &.{},
+        ports: []const u16 = &.{},
         verbose: bool = false,
     };
-
-    const result = try parse(allocator, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443", "--verbose" }, Args);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,443", "--verbose" });
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqual(2, result.ports.len);
     try std.testing.expectEqual(true, result.verbose);
 }
 
-test "deinit frees subcommand with slices" {
-    const allocator = std.testing.allocator;
+test "subcommand with list fields" {
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
         command: union(enum) {
-            serve: struct {
-                hosts: []const []const u8 = &[_][]const u8{},
-                port: u16 = 8080,
-            },
+            serve: struct { hosts: []const []const u8 = &.{}, port: u16 = 8080 },
             stop: struct {},
         },
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose", "serve", "--hosts=a.com,b.com" }, CLI);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "serve", "--hosts=a.com,b.com" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(2, result.command.serve.hosts.len);
 }
 
-test "deinit with defaults only" {
-    const allocator = std.testing.allocator;
+test "list fields with defaults only" {
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-        ports: []const u16 = &[_]u16{},
+        files: []const []const u8 = &.{},
+        ports: []const u16 = &.{},
         name: []const u8 = "default",
     };
-
-    const result = try parse(allocator, &.{"prog"}, Args);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(Args, &.{"prog"});
     try std.testing.expectEqual(0, result.files.len);
     try std.testing.expectEqual(0, result.ports.len);
 }
 
-test "deinit with optional subcommand null" {
-    const allocator = std.testing.allocator;
+test "optional subcommand null" {
+    var ta = TestArena.init();
+    defer ta.deinit();
     const CLI = struct {
         verbose: bool = false,
-        command: ?union(enum) {
-            serve: struct {
-                hosts: []const []const u8 = &[_][]const u8{},
-            },
-        } = null,
+        command: ?union(enum) { serve: struct { hosts: []const []const u8 = &.{} } } = null,
     };
-
-    const result = try parse(allocator, &.{ "prog", "--verbose" }, CLI);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(CLI, &.{ "prog", "--verbose" });
     try std.testing.expectEqual(true, result.verbose);
     try std.testing.expectEqual(null, result.command);
 }
 
-test "multi-slice error path does not leak" {
-    const allocator = std.testing.allocator;
-    const Args = struct {
-        files: []const []const u8 = &[_][]const u8{},
-        ports: []const u16 = &[_]u16{},
-    };
-
-    // Second slice has an invalid value — first slice must not leak
-    try std.testing.expectError(
-        error.InvalidValue,
-        parse(allocator, &.{ "prog", "--files=a.txt,b.txt", "--ports=80,bad" }, Args),
-    );
-}
-
-test "subcommand allocation error path does not leak" {
-    const allocator = std.testing.allocator;
-    const CLI = struct {
-        config: []const u8,
-        command: union(enum) {
-            serve: struct {
-                hosts: []const []const u8 = &[_][]const u8{},
-            },
-        },
-    };
-
-    try std.testing.expectError(
-        error.MissingRequiredFlag,
-        parse(allocator, &.{ "prog", "serve", "--hosts=a.com,b.com" }, CLI),
-    );
-}
-
 test "slice_lists array with non-slice and slice fields" {
-    const allocator = std.testing.allocator;
+    var ta = TestArena.init();
+    defer ta.deinit();
     const Args = struct {
-        verbose: bool = false, // non-slice at index 0
-        files: []const []const u8 = &[_][]const u8{}, // slice at index 1
-        name: []const u8 = "default", // slice at index 2
+        verbose: bool = false,
+        files: []const []const u8 = &.{},
+        name: []const u8 = "default",
     };
-
-    // This should work without undefined behavior in slice_lists array
-    const result = try parse(allocator, &.{ "prog", "--files=a.txt,b.txt", "--name=test" }, Args);
-    defer deinit(allocator, result);
-
+    const result = try ta.run(Args, &.{ "prog", "--files=a.txt,b.txt", "--name=test" });
     try std.testing.expectEqual(false, result.verbose);
     try std.testing.expectEqual(2, result.files.len);
     try std.testing.expectEqualSlices(u8, result.name, "test");
