@@ -1,9 +1,9 @@
-/// Arena-based, type-driven CLI parser for typed flags, list flags, subcommands,
-/// positional args, comptime-generated help, and structured errors.
+/// Type-driven CLI parser for flags, list flags, subcommands,
+/// positional args, generated help text, and error context.
 const std = @import("std");
 
-/// Carries error context out of `parse` so the caller can render messages and
-/// usage. `parse` never prints and never exits; it populates this instead.
+/// Error context from `parse`. The caller inspects this to render messages and
+/// usage. `parse` never prints to stderr and never calls process.exit.
 pub const Diagnostic = struct {
     /// The offending argument for a parse error (e.g. "--prot"), if any.
     token: ?[]const u8 = null,
@@ -12,7 +12,7 @@ pub const Diagnostic = struct {
     /// Comptime-generated usage text, set on error.HelpRequested.
     usage: ?[]const u8 = null,
 
-    /// Print usage (if set) or the error message to stderr. Convenience only.
+    /// Print usage (if set) or the error message to stderr.
     pub fn report(self: Diagnostic) void {
         if (self.usage) |u| {
             std.debug.print("{s}\n", .{u});
@@ -57,7 +57,7 @@ pub fn parse(
 }
 
 /// Apply default value or null for optional fields, otherwise return the given error.
-fn apply_default(comptime field: std.builtin.Type.StructField, result: anytype, comptime error_type: anyerror) !void {
+fn set_default_or_null(comptime field: std.builtin.Type.StructField, result: anytype, comptime error_type: anyerror) !void {
     if (field.defaultValue()) |default| {
         @field(result, field.name) = default;
     } else if (comptime @typeInfo(field.type) == .optional) {
@@ -97,11 +97,12 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     var seen = std.mem.zeroes([named_fields.len]bool);
     var positional_index: usize = 0;
 
-    var list_values = std.mem.zeroes([named_fields.len]std.ArrayList([]const u8));
+    var list_values: [named_fields.len]std.ArrayList([]const u8) = undefined;
     inline for (named_fields, 0..) |field, fi| {
-        if (comptime is_list_flag(field.type)) list_values[fi] = .empty;
+        if (comptime is_repeatable(field.type)) list_values[fi] = .empty;
     }
 
+    var positional_only = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -111,67 +112,75 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             return error.HelpRequested;
         }
 
-        if (std.mem.startsWith(u8, arg, "--")) {
-            const trimmed = arg[2..];
-            var flag_name = trimmed;
-            var flag_value: ?[]const u8 = null;
-
-            if (std.mem.indexOfScalar(u8, trimmed, '=')) |pos| {
-                flag_name = trimmed[0..pos];
-                flag_value = trimmed[pos + 1 ..];
+        if (!positional_only) {
+            if (std.mem.eql(u8, arg, "--")) {
+                positional_only = true;
+                continue;
             }
 
-            var found = false;
-            inline for (named_fields, 0..) |field, field_index| {
-                if (comptime is_subcommand_field(field)) continue;
-                if (std.mem.eql(u8, flag_name, field.name)) {
-                    found = true;
+            if (std.mem.startsWith(u8, arg, "--")) {
+                const trimmed = arg[2..];
+                var flag_name = trimmed;
+                var flag_value: ?[]const u8 = null;
 
-                    if (comptime is_list_flag(field.type)) {
-                        const fv = flag_value orelse {
-                            diag.token = arg;
-                            diag.message = "missing value for flag";
-                            return error.MissingValue;
-                        };
-                        try list_values[field_index].append(allocator, fv);
-                        seen[field_index] = true;
-                    } else {
-                        if (seen[field_index]) {
-                            diag.token = arg;
-                            diag.message = "duplicate flag";
-                            return error.DuplicateFlag;
-                        }
-                        seen[field_index] = true;
-                        @field(result, field.name) = parse_value(field.type, flag_value) catch |e| {
-                            diag.token = arg;
-                            diag.message = "invalid value";
-                            return e;
-                        };
-                    }
-                    break;
+                if (std.mem.indexOfScalar(u8, trimmed, '=')) |pos| {
+                    flag_name = trimmed[0..pos];
+                    flag_value = trimmed[pos + 1 ..];
                 }
+
+                var found = false;
+                inline for (named_fields, 0..) |field, field_index| {
+                    if (comptime is_subcommand_field(field)) continue;
+                    if (std.mem.eql(u8, flag_name, field.name)) {
+                        found = true;
+
+                        if (comptime is_repeatable(field.type)) {
+                            const fv = flag_value orelse {
+                                diag.token = arg;
+                                diag.message = "missing value for flag";
+                                return error.MissingValue;
+                            };
+                            try list_values[field_index].append(allocator, fv);
+                            seen[field_index] = true;
+                        } else {
+                            if (seen[field_index]) {
+                                diag.token = arg;
+                                diag.message = "duplicate flag";
+                                return error.DuplicateFlag;
+                            }
+                            seen[field_index] = true;
+                            @field(result, field.name) = parse_value(field.type, flag_value) catch |e| {
+                                diag.token = arg;
+                                diag.message = "invalid value";
+                                return e;
+                            };
+                        }
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    diag.token = arg;
+                    diag.message = "unknown flag";
+                    return error.UnknownFlag;
+                }
+                continue;
             }
 
-            if (!found) {
+            if (std.mem.startsWith(u8, arg, "-")) {
                 diag.token = arg;
-                diag.message = "unknown flag";
-                return error.UnknownFlag;
+                diag.message = "unexpected argument";
+                return error.UnexpectedArgument;
             }
-            continue;
-        }
 
-        if (std.mem.startsWith(u8, arg, "-")) {
-            diag.token = arg;
-            diag.message = "unexpected argument";
-            return error.UnexpectedArgument;
-        }
-
-        if (comptime subcommand_idx) |si| {
-            const subcommand_field = named_fields[si];
-            const parsed = try dispatch_subcommand(allocator, args[i..], subcommand_field.type, diag);
-            @field(result, subcommand_field.name) = parsed;
-            seen[si] = true;
-            break;
+            if (comptime subcommand_idx) |si| {
+                const subcommand_field = named_fields[si];
+                const UnionT = comptime subcommand_union(subcommand_field.type).?;
+                const parsed = try dispatch_subcommand(allocator, args[i..], UnionT, diag);
+                @field(result, subcommand_field.name) = parsed;
+                seen[si] = true;
+                break;
+            }
         }
 
         if (positional_fields.len == 0) {
@@ -202,9 +211,9 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     inline for (named_fields, 0..) |field, field_index| {
         if (comptime is_subcommand_field(field)) {
             if (!seen[field_index]) {
-                try apply_default(field, &result, error.MissingSubcommand);
+                try set_default_or_null(field, &result, error.MissingSubcommand);
             }
-        } else if (comptime is_list_flag(field.type)) {
+        } else if (comptime is_repeatable(field.type)) {
             if (seen[field_index]) {
                 const items = list_values[field_index].items;
                 const child = comptime @typeInfo(field.type).pointer.child;
@@ -224,7 +233,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             }
         } else {
             if (!seen[field_index]) {
-                try apply_default(field, &result, error.MissingRequiredFlag);
+                try set_default_or_null(field, &result, error.MissingRequiredFlag);
             }
         }
     }
@@ -232,7 +241,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     // Apply defaults for missing positional args.
     inline for (positional_fields, 0..) |pfield, pi| {
         if (pi >= positional_index) {
-            try apply_default(pfield, &result, error.MissingRequiredPositional);
+            try set_default_or_null(pfield, &result, error.MissingRequiredPositional);
         }
     }
 
@@ -275,7 +284,7 @@ fn parse_bool(value: []const u8) !bool {
 }
 
 /// Parse a subcommand field as either a struct or nested union(enum).
-fn parse_variant(
+fn parse_subcommand_payload(
     allocator: std.mem.Allocator,
     comptime field: std.builtin.Type.UnionField,
     args: []const []const u8,
@@ -313,7 +322,7 @@ fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, c
 
     inline for (fields) |field| {
         if (std.mem.eql(u8, arg, field.name)) {
-            const parsed = try parse_variant(allocator, field, args[1..], diag);
+            const parsed = try parse_subcommand_payload(allocator, field, args[1..], diag);
             return @unionInit(T, field.name, parsed);
         }
     }
@@ -324,19 +333,31 @@ fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, c
 }
 
 /// Return true if the type is a list flag (a `[]const T` slice where `T != u8`; strings are not lists).
-fn is_list_flag(comptime T: type) bool {
+fn is_repeatable(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .pointer => |ptr| ptr.size == .slice and ptr.child != u8,
         else => false,
     };
 }
 
-/// Check whether a struct field is a union(enum) subcommand carrier.
-fn is_subcommand_field(comptime field: std.builtin.Type.StructField) bool {
-    return switch (@typeInfo(field.type)) {
-        .@"union" => |u| u.tag_type != null,
-        else => false,
+/// If `T` is a tagged union (or an optional wrapping one), return that union
+/// type; otherwise return null. Used so a subcommand field may be declared as
+/// either `union(enum) {...}` (required) or `?union(enum) {...}` (optional).
+fn subcommand_union(comptime T: type) ?type {
+    return switch (@typeInfo(T)) {
+        .@"union" => |u| if (u.tag_type != null) T else null,
+        .optional => |o| switch (@typeInfo(o.child)) {
+            .@"union" => |u| if (u.tag_type != null) o.child else null,
+            else => null,
+        },
+        else => null,
     };
+}
+
+/// Check whether a struct field is a union(enum) subcommand carrier. The field
+/// may be a bare tagged union (required) or an optional tagged union (optional).
+fn is_subcommand_field(comptime field: std.builtin.Type.StructField) bool {
+    return subcommand_union(field.type) != null;
 }
 
 /// Find the index of the single union(enum) subcommand field, if any.
@@ -356,31 +377,42 @@ fn is_help_flag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-/// Public: the usage text for a type. Uses `pub const help` if declared,
-/// otherwise the comptime-generated usage text.
+/// Usage text for a type. Uses `pub const help` if declared,
+/// otherwise generates it at comptime.
 pub fn usage(comptime T: type) []const u8 {
     if (@hasDecl(T, "help")) return T.help;
     return render_usage(T);
 }
 
 fn render_usage(comptime T: type) []const u8 {
-    comptime {
-        return switch (@typeInfo(T)) {
-            .@"struct" => generate_struct_usage(T),
-            .@"union" => generate_union_usage(T),
-            else => "",
-        };
-    }
+    return comptime switch (@typeInfo(T)) {
+        .@"struct" => generate_struct_usage(T),
+        .@"union" => generate_union_usage(T),
+        else => "",
+    };
 }
 
 fn generate_struct_usage(comptime T: type) []const u8 {
-    comptime {
+    return comptime blk: {
+        const fields = std.meta.fields(T);
+        const marker_idx = separator_index(fields);
+
         var flags_text: []const u8 = "";
         var commands_text: []const u8 = "";
-        for (std.meta.fields(T)) |field| {
-            if (std.mem.eql(u8, field.name, "--")) continue;
-            if (is_subcommand_field(field)) {
-                for (std.meta.fields(field.type)) |variant| {
+        var positionals_text: []const u8 = "";
+
+        for (fields, 0..) |field, i| {
+            if (marker_idx) |idx| {
+                if (i > idx) {
+                    positionals_text = positionals_text ++ "  " ++ field.name ++ "  " ++
+                        @typeName(field.type) ++ default_label(field) ++ "\n";
+                    continue;
+                }
+            }
+            if (std.mem.eql(u8, field.name, "--")) {
+                continue;
+            } else if (is_subcommand_field(field)) {
+                for (std.meta.fields(subcommand_union(field.type).?)) |variant| {
                     commands_text = commands_text ++ "  " ++ variant.name ++ "\n";
                 }
             } else {
@@ -388,26 +420,28 @@ fn generate_struct_usage(comptime T: type) []const u8 {
                     @typeName(field.type) ++ default_label(field) ++ "\n";
             }
         }
+
         var out: []const u8 = "";
         if (flags_text.len > 0) out = out ++ "Flags:\n" ++ flags_text;
         if (commands_text.len > 0) out = out ++ "Commands:\n" ++ commands_text;
-        return out;
-    }
+        if (positionals_text.len > 0) out = out ++ "Positionals:\n" ++ positionals_text;
+        break :blk out;
+    };
 }
 
 fn generate_union_usage(comptime T: type) []const u8 {
-    comptime {
+    return comptime blk: {
         var out: []const u8 = "Commands:\n";
         for (std.meta.fields(T)) |field| {
             out = out ++ "  " ++ field.name ++ "\n";
         }
-        return out;
-    }
+        break :blk out;
+    };
 }
 
 fn default_label(comptime field: std.builtin.Type.StructField) []const u8 {
     if (@typeInfo(field.type) == .optional) return " (optional)";
-    if (is_list_flag(field.type)) return " (repeatable)";
+    if (is_repeatable(field.type)) return " (repeatable)";
     if (field.defaultValue()) |d| {
         return " (default: " ++ value_to_string(field.type, d) ++ ")";
     }
@@ -967,6 +1001,91 @@ test "default variant replaces optional subcommand" {
     try std.testing.expectEqual(3000, served.command.serve.port);
 }
 
+test "optional subcommand present" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = struct {
+        verbose: bool = false,
+        command: ?union(enum) {
+            serve: struct { port: u16 = 8080 },
+            stop: struct {},
+        } = null,
+    };
+    const result = try ta.run(CLI, &.{ "prog", "--verbose", "serve", "--port=3000" });
+    try std.testing.expectEqual(true, result.verbose);
+    try std.testing.expect(result.command != null);
+    try std.testing.expectEqual(3000, result.command.?.serve.port);
+}
+
+test "optional subcommand absent is null" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = struct {
+        verbose: bool = false,
+        command: ?union(enum) {
+            serve: struct { port: u16 = 8080 },
+            stop: struct {},
+        } = null,
+    };
+    const result = try ta.run(CLI, &.{ "prog", "--verbose" });
+    try std.testing.expectEqual(true, result.verbose);
+    try std.testing.expectEqual(@as(@TypeOf(result.command), null), result.command);
+}
+
+test "optional subcommand bare (no args) is null" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = struct {
+        command: ?union(enum) {
+            serve: struct { port: u16 = 8080 },
+        } = null,
+    };
+    const result = try ta.run(CLI, &.{"prog"});
+    try std.testing.expectEqual(@as(@TypeOf(result.command), null), result.command);
+}
+
+test "optional subcommand with void variant" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct {
+        command: ?union(enum) {
+            start: struct { host: []const u8 = "localhost" },
+            stop: void,
+        } = null,
+    };
+    const result = try ta.run(Args, &.{ "prog", "start", "--host=0.0.0.0" });
+    try std.testing.expectEqualStrings("0.0.0.0", result.command.?.start.host);
+
+    const stopped = try ta.run(Args, &.{ "prog", "stop" });
+    try std.testing.expect(stopped.command.? == .stop);
+}
+
+test "optional subcommand unknown still errors" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const CLI = struct {
+        command: ?union(enum) {
+            serve: struct {},
+        } = null,
+    };
+    try std.testing.expectError(error.UnknownSubcommand, ta.run(CLI, &.{ "prog", "restart" }));
+}
+
+test "auto usage lists optional subcommand commands" {
+    const CLI = struct {
+        verbose: bool = false,
+        command: ?union(enum) { serve: struct {}, stop: struct {} } = null,
+    };
+    try std.testing.expectEqualStrings(
+        \\Flags:
+        \\  --verbose  bool (default: false)
+        \\Commands:
+        \\  serve
+        \\  stop
+        \\
+    , comptime usage(CLI));
+}
+
 test "subcommand with nested union" {
     var ta = TestArena.init();
     defer ta.deinit();
@@ -1044,7 +1163,7 @@ test "positional inside subcommand" {
     try std.testing.expectEqualStrings("a.out", result.command.compile.output);
 }
 
-// --- List (ex-deinit) tests ---
+// --- List field tests ---
 
 test "list fields parse correctly" {
     var ta = TestArena.init();
