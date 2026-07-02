@@ -87,7 +87,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
     if (marker_idx) |idx| {
         if (fields[idx].type != void) {
-            @compileError("'@"--"' marker must be declared as void");
+            @compileError("'@" - -"' marker must be declared as void");
         }
     }
 
