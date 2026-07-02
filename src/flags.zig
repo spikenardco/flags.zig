@@ -35,6 +35,9 @@ pub const Diagnostic = struct {
 /// Allocator is an arena owned by the caller; the parser never frees and never exits.
 /// Pass a `*Diagnostic` to receive structured error context or usage text on
 /// `error.HelpRequested`.
+///
+/// The allocator must be an arena. Individual allocations are never freed during
+/// parsing. Call `arena.deinit()` once when the result is no longer needed.
 pub fn parse(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -98,9 +101,9 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     var positional_index: usize = 0;
 
     var list_values: [named_fields.len]std.ArrayList([]const u8) = undefined;
-    inline for (named_fields, 0..) |field, fi| {
-        if (comptime is_repeatable(field.type)) list_values[fi] = .empty;
-    }
+    // Init everything. Unused slots stay empty, no undefined footgun.
+    // Waste is trivial, a couple dozen bytes per non-list field.
+    inline for (&list_values) |*lv| lv.* = .empty;
 
     var positional_only = false;
     var i: usize = 0;
@@ -130,14 +133,14 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
                 var found = false;
                 inline for (named_fields, 0..) |field, field_index| {
-                    if (comptime is_subcommand_field(field)) continue;
+                    if (comptime subcommand_info(field.type) != null) continue;
                     if (std.mem.eql(u8, flag_name, field.name)) {
                         found = true;
 
                         if (comptime is_repeatable(field.type)) {
                             const fv = flag_value orelse {
                                 diag.token = arg;
-                                diag.message = "missing value for flag";
+                                diag.message = "missing value";
                                 return error.MissingValue;
                             };
                             try list_values[field_index].append(allocator, fv);
@@ -151,7 +154,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                             seen[field_index] = true;
                             @field(result, field.name) = parse_value(field.type, flag_value) catch |e| {
                                 diag.token = arg;
-                                diag.message = "invalid value";
+                                diag.message = comptime "invalid value for --" ++ field.name ++ ", expected " ++ type_label(field.type);
                                 return e;
                             };
                         }
@@ -175,7 +178,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
             if (comptime subcommand_idx) |si| {
                 const subcommand_field = named_fields[si];
-                const UnionT = comptime subcommand_union(subcommand_field.type).?;
+                const UnionT = comptime subcommand_info(subcommand_field.type).?.union_type;
                 const parsed = try dispatch_subcommand(allocator, args[i..], UnionT, diag);
                 @field(result, subcommand_field.name) = parsed;
                 seen[si] = true;
@@ -209,7 +212,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
     // Build slices and apply defaults for named fields.
     inline for (named_fields, 0..) |field, field_index| {
-        if (comptime is_subcommand_field(field)) {
+        if (comptime subcommand_info(field.type) != null) {
             if (!seen[field_index]) {
                 try set_default_or_null(field, &result, error.MissingSubcommand);
             }
@@ -246,6 +249,19 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     }
 
     return result;
+}
+
+/// Human-readable label for a type, used in error messages.
+fn type_label(comptime T: type) []const u8 {
+    comptime return switch (@typeInfo(T)) {
+        .int => @typeName(T),
+        .float => @typeName(T),
+        .bool => "bool",
+        .@"enum" => @typeName(T),
+        .optional => |o| type_label(o.child),
+        .pointer => |p| if (p.size == .slice and p.child == u8) "string" else @typeName(T),
+        else => @typeName(T),
+    };
 }
 
 /// Unwrap optional types before parsing the inner scalar value.
@@ -290,11 +306,11 @@ fn parse_subcommand_payload(
     args: []const []const u8,
     diag: *Diagnostic,
 ) !field.type {
-    const subcommand_info = @typeInfo(field.type);
-    return switch (subcommand_info) {
+    const sc_type_info = @typeInfo(field.type);
+    return switch (sc_type_info) {
         .@"struct" => try parse_flags(allocator, args, field.type, diag),
         .@"union" => blk: {
-            if (subcommand_info.@"union".tag_type == null) {
+            if (sc_type_info.@"union".tag_type == null) {
                 @compileError("subcommand types must be struct or union(enum)");
             }
             break :blk try dispatch_subcommand(allocator, args, field.type, diag);
@@ -340,31 +356,36 @@ fn is_repeatable(comptime T: type) bool {
     };
 }
 
-/// If `T` is a tagged union (or an optional wrapping one), return that union
-/// type; otherwise return null. Used so a subcommand field may be declared as
-/// either `union(enum) {...}` (required) or `?union(enum) {...}` (optional).
-fn subcommand_union(comptime T: type) ?type {
+/// Info about a tagged union field that acts as a subcommand carrier.
+/// The field may be a bare union(enum) (required) or an optional one (optional).
+const SubcommandInfo = struct {
+    union_type: type,
+    is_optional: bool,
+};
+
+/// If T is a tagged union (possibly wrapped in optional), return SubcommandInfo.
+fn subcommand_info(comptime T: type) ?SubcommandInfo {
     return switch (@typeInfo(T)) {
-        .@"union" => |u| if (u.tag_type != null) T else null,
+        .@"union" => |u| if (u.tag_type != null)
+            .{ .union_type = T, .is_optional = false }
+        else
+            null,
         .optional => |o| switch (@typeInfo(o.child)) {
-            .@"union" => |u| if (u.tag_type != null) o.child else null,
+            .@"union" => |u| if (u.tag_type != null)
+                .{ .union_type = o.child, .is_optional = true }
+            else
+                null,
             else => null,
         },
         else => null,
     };
 }
 
-/// Check whether a struct field is a union(enum) subcommand carrier. The field
-/// may be a bare tagged union (required) or an optional tagged union (optional).
-fn is_subcommand_field(comptime field: std.builtin.Type.StructField) bool {
-    return subcommand_union(field.type) != null;
-}
-
 /// Find the index of the single union(enum) subcommand field, if any.
 fn find_subcommand_field(comptime fields: []const std.builtin.Type.StructField) ?usize {
     var idx: ?usize = null;
     for (fields, 0..) |field, i| {
-        if (is_subcommand_field(field)) {
+        if (subcommand_info(field.type) != null) {
             if (idx != null) @compileError("only one union(enum) subcommand field is allowed");
             idx = i;
         }
@@ -411,8 +432,8 @@ fn generate_struct_usage(comptime T: type) []const u8 {
             }
             if (std.mem.eql(u8, field.name, "--")) {
                 continue;
-            } else if (is_subcommand_field(field)) {
-                for (std.meta.fields(subcommand_union(field.type).?)) |variant| {
+            } else if (subcommand_info(field.type)) |sc_info| {
+                for (std.meta.fields(sc_info.union_type)) |variant| {
                     commands_text = commands_text ++ "  " ++ variant.name ++ "\n";
                 }
             } else {
