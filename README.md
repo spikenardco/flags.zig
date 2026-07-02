@@ -223,27 +223,6 @@ The parser extracts typed values. What you do with them is your business.
 - **Strict boolean values.** Only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.).
 - **No subcommands + positional args.** Use either subcommands or positional arguments, not both in the same struct.
 
-## Changelog
-
-### 0.2.0 (2026-07-02)
-
-- **Positional args**: Declare positional arguments with `@"--": void` marker and trailing fields
-- **Optional subcommands**: `command: ?union(enum) { ... } = null` is now supported
-- **`@"--"` separator marker**: Replaces the old `positional: struct { ... }` approach
-- **Comptime-generated usage text**: `--help` auto-generates usage from the schema type; override with `pub const help`
-- **Structured diagnostics**: `Diagnostic` captures token, message, and usage text. The parser never prints or exits.
-- **Arena model**: Parser uses an arena allocator. No more `deinit()` calls. Just `arena.deinit()` when done.
-- **List flags**: Repeated `--x=a --x=b` syntax; comma-split removed
-- **Renames**:
-  - `apply_default` → `set_default_or_null`
-  - `is_list_flag` → `is_repeatable`
-  - `parse_variant` → `parse_subcommand_payload`
-- **Zig 0.16.0**: Migrated to `std.process.Init`, arena allocator pattern, `.empty` array-list style, `fingerprint` in `build.zig.zon`
-
-### 0.1.0 (2026-02-22)
-
-- Initial release
-
 ## Credits
 
 Heavily inspired by [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle). The struct-as-schema design, comptime parsing, arena memory model, `Diagnostic`-style error reporting, and no-short-flags philosophy all come from there.
