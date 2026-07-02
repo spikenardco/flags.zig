@@ -24,7 +24,7 @@ A type-safe command-line argument parser for Zig. Inspired by **Rust clap** and 
 ### 1. Fetch the library
 
 ```bash
-zig fetch --save git+https://github.com/doxalabs/flags.zig
+zig fetch --save git+https://github.com/spikenardco/flags.zig
 ```
 
 ### 2. Add to your `build.zig`
@@ -173,32 +173,32 @@ Positional arguments are bare words that don't start with `-`. They can be
 interleaved with flags in any order. A bare argument starting with `-` is
 rejected (this library only supports `--name=value` flag syntax).
 
-### Subcommands without optional unions
+### Optional Subcommands
 
-Optional subcommands (`command: ?union = null`) are not supported. Use a `default` variant instead:
+Subcommands can be made optional by wrapping the union type in `?`:
 
 ```zig
-command: union(enum) {
-    default: struct {},
-    serve:   struct { port: u16 = 8080 },
-} = .{ .default = .{} },
+const CLI = struct {
+    verbose: bool = false,
+    command: ?union(enum) {
+        serve: struct { port: u16 = 8080 },
+        stop:  struct {},
+    } = null,
+};
 ```
+
+When the subcommand is absent, `command` is `null`.
 
 ## Best Practices
 
-### DO
-
-1. **Use struct defaults** for common values
-2. **Define help** via `pub const help` declarations when you need hand-written text
-3. **Use unions** for mutually exclusive subcommands
-4. **Use enums** for constrained choices
-5. **Use optional types** for truly optional flags
-
-### DON'T
-
-1. **Don't** skip error handling
-2. **Don't** make all flags optional (defeats type safety)
-3. **Don't** use runtime string manipulation for help
+- Use struct defaults for common values.
+- Define help with `pub const help` when you need hand-written text.
+- Use unions for mutually exclusive subcommands.
+- Use enums for constrained choices.
+- Use optional types for truly optional flags.
+- Always handle the error from `parse`. Skipping it defeats the point.
+- Don't make every field optional. You lose the type safety that makes this approach useful.
+- Keep help text at compile time. No runtime string building.
 
 ## Parser vs Application Boundary
 
@@ -219,23 +219,33 @@ The parser extracts typed values. What you do with them is your business.
 - **No custom types.** Only built-in types and enums.
 - **No nested slices.** Slices of slices not supported (`[][]T`).
 - **No comma-separated lists.** Use repeated flags (`--x=a --x=b`).
-- **No optional subcommands.** Use a `default` variant.
 - **Equals syntax only.** Use `--name=value` not `--name value`.
 - **Strict boolean values.** Only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.).
 - **No subcommands + positional args.** Use either subcommands or positional arguments, not both in the same struct.
 
-## Migration (from 0.1)
+## Changelog
 
-- `flags.parse(a, args, T)` → `flags.parse(a, args, T, &diag)` with `var diag: flags.Diagnostic = .{};`
-- Remove `defer flags.deinit(...)`; use an arena allocator instead (nothing to free).
-- `--tags=a,b` → `--tags=a --tags=b` (comma lists removed).
-- `positional: struct { ... }` → `@"--": void` + trailing fields, accessed as `result.<name>`.
-- `command: ?union = null` → a required union with a `default: struct {}` variant.
-- Handle `error.HelpRequested` in your `catch` (print `diag.usage` via `diag.report()`, exit 0).
+### 0.2.0 (2026-07-02)
+
+- **Positional args**: Declare positional arguments with `@"--": void` marker and trailing fields
+- **Optional subcommands**: `command: ?union(enum) { ... } = null` is now supported
+- **`@"--"` separator marker**: Replaces the old `positional: struct { ... }` approach
+- **Comptime-generated usage text**: `--help` auto-generates usage from the schema type; override with `pub const help`
+- **Structured diagnostics**: `Diagnostic` captures token, message, and usage text. The parser never prints or exits.
+- **Arena model**: Parser uses an arena allocator. No more `deinit()` calls. Just `arena.deinit()` when done.
+- **List flags**: Repeated `--x=a --x=b` syntax; comma-split removed
+- **Renames**:
+  - `apply_default` → `set_default_or_null`
+  - `is_list_flag` → `is_repeatable`
+  - `parse_variant` → `parse_subcommand_payload`
+- **Zig 0.16.0**: Migrated to `std.process.Init`, arena allocator pattern, `.empty` array-list style, `fingerprint` in `build.zig.zon`
+
+### 0.1.0 (2026-02-22)
+
+- Initial release
 
 ## Credits
 
-This library draws inspiration from two projects:
+Heavily inspired by [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle). The struct-as-schema design, comptime parsing, arena memory model, `Diagnostic`-style error reporting, and no-short-flags philosophy all come from there.
 
-- [TigerBeetle's flags](https://github.com/tigerbeetle/tigerbeetle) for struct-based flag definitions and zero-cost abstractions
-- [Rust clap](https://github.com/clap-rs/clap) for declarative API design and derive-style patterns
+The declarative "derive" sensibility (define a type, get a parser) was popularized by [Rust clap](https://github.com/clap-rs/clap), and that was the conceptual starting point for this project.
