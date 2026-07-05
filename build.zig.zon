@@ -1,6 +1,6 @@
 .{
     .name = .flags,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0xb0541bae28a351a, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
