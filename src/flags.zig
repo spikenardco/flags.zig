@@ -44,7 +44,10 @@ pub fn parse(
     comptime T: type,
     diag: *Diagnostic,
 ) !T {
-    if (args.len == 0) return error.EmptyArgs;
+    if (args.len == 0) {
+        diag.message = "no arguments provided";
+        return error.EmptyArgs;
+    }
     const trimmed = args[1..];
     const info = @typeInfo(T);
     switch (info) {
@@ -214,7 +217,10 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     inline for (named_fields, 0..) |field, field_index| {
         if (comptime subcommand_info(field.type) != null) {
             if (!seen[field_index]) {
-                try set_default_or_null(field, &result, error.MissingSubcommand);
+                set_default_or_null(field, &result, error.MissingSubcommand) catch |err| {
+                    diag.message = "missing required subcommand";
+                    return err;
+                };
             }
         } else if (comptime is_repeatable(field.type)) {
             if (seen[field_index]) {
@@ -231,12 +237,16 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                     const default_slice: field.type = default;
                     @field(result, field.name) = try allocator.dupe(child, default_slice);
                 } else {
+                    diag.message = "missing required flag: --" ++ field.name;
                     return error.MissingRequiredFlag;
                 }
             }
         } else {
             if (!seen[field_index]) {
-                try set_default_or_null(field, &result, error.MissingRequiredFlag);
+                set_default_or_null(field, &result, error.MissingRequiredFlag) catch |err| {
+                    diag.message = "missing required flag: --" ++ field.name;
+                    return err;
+                };
             }
         }
     }
@@ -244,7 +254,10 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     // Apply defaults for missing positional args.
     inline for (positional_fields, 0..) |pfield, pi| {
         if (pi >= positional_index) {
-            try set_default_or_null(pfield, &result, error.MissingRequiredPositional);
+            set_default_or_null(pfield, &result, error.MissingRequiredPositional) catch |err| {
+                diag.message = "missing required positional argument: " ++ pfield.name;
+                return err;
+            };
         }
     }
 
@@ -328,7 +341,10 @@ fn parse_subcommand_payload(
 fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
     const fields = std.meta.fields(T);
 
-    if (args.len == 0) return error.MissingSubcommand;
+    if (args.len == 0) {
+        diag.message = "missing required subcommand";
+        return error.MissingSubcommand;
+    }
 
     const arg = args[0];
     if (is_help_flag(arg)) {
