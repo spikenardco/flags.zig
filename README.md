@@ -223,7 +223,7 @@ The parser extracts typed values. What you do with them is your business.
 
 - **No short flags.** Only long flags (`--flag=value` or bare booleans), except `-h` for help. For brevity, use `--v` instead of `-v`.
 - **No custom types.** Only built-in types and enums.
-- **No nested slices.** Slices of slices not supported (`[][]T`).
+- **No nested list values.** String lists (`[]const []const u8`) are supported, but other list elements cannot themselves be lists.
 - **No comma-separated lists.** Use repeated flags (`--x=a --x=b`).
 - **Equals syntax only.** Use `--name=value` not `--name value`.
 - **Strict boolean values.** Only `true` and `false` are accepted (no `1`, `0`, `yes`, `no`, etc.).
