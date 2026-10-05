@@ -64,47 +64,57 @@ pub fn parse(
 }
 
 /// Apply default value or null for optional fields, otherwise return the given error.
-fn set_default_or_null(comptime field: std.builtin.Type.StructField, result: anytype, comptime error_type: anyerror) !void {
-    if (field.defaultValue()) |default| {
-        @field(result, field.name) = default;
-    } else if (comptime @typeInfo(field.type) == .optional) {
-        @field(result, field.name) = @as(field.type, null);
+fn set_default_or_null(
+    comptime field_name: [:0]const u8,
+    comptime FieldType: type,
+    comptime field_attrs: std.lang.Type.Struct.FieldAttributes,
+    result: anytype,
+    comptime error_type: anyerror,
+) !void {
+    if (field_attrs.defaultValue(FieldType)) |default| {
+        @field(result, field_name) = default;
+    } else if (comptime @typeInfo(FieldType) == .optional) {
+        @field(result, field_name) = @as(FieldType, null);
     } else {
         return error_type;
     }
 }
 
 /// Find the index of the `@"--"` field that separates flags from positional args.
-fn separator_index(comptime fields: []const std.builtin.Type.StructField) ?usize {
-    inline for (fields, 0..) |field, index| {
-        if (std.mem.eql(u8, field.name, "--")) return index;
+fn separator_index(comptime field_names: []const [:0]const u8) ?usize {
+    inline for (field_names, 0..) |field_name, index| {
+        if (std.mem.eql(u8, field_name, "--")) return index;
     }
     return null;
 }
 
 /// Parse a struct schema of named flags and optional positional args.
 fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
-    const fields = std.meta.fields(T);
-    const marker_idx = comptime separator_index(fields);
-    const named_fields = if (marker_idx) |idx| fields[0..idx] else fields;
-    const positional_fields = if (marker_idx) |idx| fields[idx + 1 ..] else &[_]std.builtin.Type.StructField{};
+    const struct_info = @typeInfo(T).@"struct";
+    const marker_idx = comptime separator_index(struct_info.field_names);
+    const named_field_names = if (marker_idx) |idx| struct_info.field_names[0..idx] else struct_info.field_names;
+    const named_field_types = if (marker_idx) |idx| struct_info.field_types[0..idx] else struct_info.field_types;
+    const named_field_attrs = if (marker_idx) |idx| struct_info.field_attrs[0..idx] else struct_info.field_attrs;
+    const positional_field_names = if (marker_idx) |idx| struct_info.field_names[idx + 1 ..] else &.{};
+    const positional_field_types = if (marker_idx) |idx| struct_info.field_types[idx + 1 ..] else &.{};
+    const positional_field_attrs = if (marker_idx) |idx| struct_info.field_attrs[idx + 1 ..] else &.{};
 
     if (marker_idx) |idx| {
-        if (fields[idx].type != void) {
+        if (struct_info.field_types[idx] != void) {
             @compileError("'--' marker must be declared as void");
         }
     }
 
-    const subcommand_idx = comptime find_subcommand_field(named_fields);
-    if (comptime subcommand_idx != null and positional_fields.len > 0) {
+    const subcommand_idx = comptime find_subcommand_field(named_field_types);
+    if (comptime subcommand_idx != null and positional_field_names.len > 0) {
         @compileError("subcommands and positional arguments cannot coexist in the same struct");
     }
 
     var result: T = undefined;
-    var seen = std.mem.zeroes([named_fields.len]bool);
+    var seen = std.mem.zeroes([named_field_names.len]bool);
     var positional_index: usize = 0;
 
-    var list_values: [named_fields.len]std.ArrayList([]const u8) = undefined;
+    var list_values: [named_field_names.len]std.ArrayList([]const u8) = undefined;
     // Keep every slot initialized. Only list fields use these values.
     inline for (&list_values) |*list_value| list_value.* = .empty;
     defer {
@@ -138,12 +148,12 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                 }
 
                 var found = false;
-                inline for (named_fields, 0..) |field, field_index| {
-                    if (comptime subcommand_info(field.type) != null) continue;
-                    if (std.mem.eql(u8, flag_name, field.name)) {
+                inline for (named_field_names, named_field_types, 0..) |field_name, FieldType, field_index| {
+                    if (comptime subcommand_info(FieldType) != null) continue;
+                    if (std.mem.eql(u8, flag_name, field_name)) {
                         found = true;
 
-                        if (comptime is_repeatable(field.type)) {
+                        if (comptime is_repeatable(FieldType)) {
                             const fv = flag_value orelse {
                                 diag.token = arg;
                                 diag.message = "missing value";
@@ -158,12 +168,12 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                                 return error.DuplicateFlag;
                             }
                             seen[field_index] = true;
-                            @field(result, field.name) = parse_value(allocator, field.type, flag_value) catch |e| {
+                            @field(result, field_name) = parse_value(allocator, FieldType, flag_value) catch |e| {
                                 diag.token = arg;
                                 diag.message = if (e == error.MissingValue)
                                     "missing value"
                                 else
-                                    comptime "invalid value for --" ++ field.name ++ ", expected " ++ type_label(field.type);
+                                    comptime "invalid value for --" ++ field_name ++ ", expected " ++ type_label(FieldType);
                                 return e;
                             };
                         }
@@ -186,30 +196,30 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             }
 
             if (comptime subcommand_idx) |si| {
-                const subcommand_field = named_fields[si];
-                const UnionT = comptime subcommand_info(subcommand_field.type).?.union_type;
+                const subcommand_name = named_field_names[si];
+                const UnionT = comptime subcommand_info(named_field_types[si]).?.union_type;
                 const parsed = try dispatch_subcommand(allocator, args[i..], UnionT, diag);
-                @field(result, subcommand_field.name) = parsed;
+                @field(result, subcommand_name) = parsed;
                 seen[si] = true;
                 break;
             }
         }
 
-        if (positional_fields.len == 0) {
+        if (positional_field_names.len == 0) {
             diag.token = arg;
             diag.message = "unexpected argument";
             return error.UnexpectedArgument;
         }
 
-        if (positional_index >= positional_fields.len) {
+        if (positional_index >= positional_field_names.len) {
             diag.token = arg;
             diag.message = "too many positional arguments";
             return error.TooManyPositionals;
         }
 
-        inline for (positional_fields, 0..) |pfield, pi| {
+        inline for (positional_field_names, positional_field_types, 0..) |field_name, FieldType, pi| {
             if (pi == positional_index) {
-                @field(result, pfield.name) = parse_value(allocator, pfield.type, arg) catch |e| {
+                @field(result, field_name) = parse_value(allocator, FieldType, arg) catch |e| {
                     diag.token = arg;
                     diag.message = if (e == error.MissingValue) "missing value" else "invalid value";
                     return e;
@@ -219,47 +229,47 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
         positional_index += 1;
     }
 
-    inline for (named_fields, 0..) |field, field_index| {
-        if (comptime subcommand_info(field.type) != null) {
+    inline for (named_field_names, named_field_types, named_field_attrs, 0..) |field_name, FieldType, field_attrs, field_index| {
+        if (comptime subcommand_info(FieldType) != null) {
             if (!seen[field_index]) {
-                set_default_or_null(field, &result, error.MissingSubcommand) catch |err| {
+                set_default_or_null(field_name, FieldType, field_attrs, &result, error.MissingSubcommand) catch |err| {
                     diag.message = "missing required subcommand";
                     return err;
                 };
             }
-        } else if (comptime is_repeatable(field.type)) {
+        } else if (comptime is_repeatable(FieldType)) {
             if (seen[field_index]) {
                 const items = list_values[field_index].items;
-                const child = comptime @typeInfo(field.type).pointer.child;
+                const child = comptime @typeInfo(FieldType).pointer.child;
                 const typed = try allocator.alloc(child, items.len);
                 for (items, 0..) |raw, j| {
                     typed[j] = try parse_scalar(allocator, child, raw);
                 }
-                @field(result, field.name) = typed;
+                @field(result, field_name) = typed;
             } else {
-                const child = comptime @typeInfo(field.type).pointer.child;
-                if (field.defaultValue()) |default| {
-                    const default_slice: field.type = default;
-                    @field(result, field.name) = try allocator.dupe(child, default_slice);
+                const child = comptime @typeInfo(FieldType).pointer.child;
+                if (field_attrs.defaultValue(FieldType)) |default| {
+                    const default_slice: FieldType = default;
+                    @field(result, field_name) = try allocator.dupe(child, default_slice);
                 } else {
-                    diag.message = "missing required flag: --" ++ field.name;
+                    diag.message = "missing required flag: --" ++ field_name;
                     return error.MissingRequiredFlag;
                 }
             }
         } else {
             if (!seen[field_index]) {
-                set_default_or_null(field, &result, error.MissingRequiredFlag) catch |err| {
-                    diag.message = "missing required flag: --" ++ field.name;
+                set_default_or_null(field_name, FieldType, field_attrs, &result, error.MissingRequiredFlag) catch |err| {
+                    diag.message = "missing required flag: --" ++ field_name;
                     return err;
                 };
             }
         }
     }
 
-    inline for (positional_fields, 0..) |pfield, pi| {
+    inline for (positional_field_names, positional_field_types, positional_field_attrs, 0..) |field_name, FieldType, field_attrs, pi| {
         if (pi >= positional_index) {
-            set_default_or_null(pfield, &result, error.MissingRequiredPositional) catch |err| {
-                diag.message = "missing required positional argument: " ++ pfield.name;
+            set_default_or_null(field_name, FieldType, field_attrs, &result, error.MissingRequiredPositional) catch |err| {
+                diag.message = "missing required positional argument: " ++ field_name;
                 return err;
             };
         }
@@ -319,18 +329,18 @@ fn parse_bool(value: []const u8) !bool {
 /// Parse a subcommand field as either a struct or nested union(enum).
 fn parse_subcommand_payload(
     allocator: std.mem.Allocator,
-    comptime field: std.builtin.Type.UnionField,
+    comptime Payload: type,
     args: []const []const u8,
     diag: *Diagnostic,
-) !field.type {
-    const sc_type_info = @typeInfo(field.type);
+) !Payload {
+    const sc_type_info = @typeInfo(Payload);
     return switch (sc_type_info) {
-        .@"struct" => try parse_flags(allocator, args, field.type, diag),
+        .@"struct" => try parse_flags(allocator, args, Payload, diag),
         .@"union" => blk: {
             if (sc_type_info.@"union".tag_type == null) {
                 @compileError("subcommand types must be struct or union(enum)");
             }
-            break :blk try dispatch_subcommand(allocator, args, field.type, diag);
+            break :blk try dispatch_subcommand(allocator, args, Payload, diag);
         },
         .void => if (args.len > 0) blk: {
             diag.token = args[0];
@@ -343,7 +353,7 @@ fn parse_subcommand_payload(
 
 /// Match and parse the first arg as a subcommand name, then parse the rest.
 fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
-    const fields = std.meta.fields(T);
+    const union_info = @typeInfo(T).@"union";
 
     if (args.len == 0) {
         diag.message = "missing required subcommand";
@@ -356,10 +366,10 @@ fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, c
         return error.HelpRequested;
     }
 
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, arg, field.name)) {
-            const parsed = try parse_subcommand_payload(allocator, field, args[1..], diag);
-            return @unionInit(T, field.name, parsed);
+    inline for (union_info.field_names, union_info.field_types) |field_name, Payload| {
+        if (std.mem.eql(u8, arg, field_name)) {
+            const parsed = try parse_subcommand_payload(allocator, Payload, args[1..], diag);
+            return @unionInit(T, field_name, parsed);
         }
     }
 
@@ -401,10 +411,10 @@ fn subcommand_info(comptime T: type) ?SubcommandInfo {
 }
 
 /// Find the index of the single union(enum) subcommand field, if any.
-fn find_subcommand_field(comptime fields: []const std.builtin.Type.StructField) ?usize {
+fn find_subcommand_field(comptime field_types: []const type) ?usize {
     var idx: ?usize = null;
-    for (fields, 0..) |field, i| {
-        if (subcommand_info(field.type) != null) {
+    for (field_types, 0..) |FieldType, i| {
+        if (subcommand_info(FieldType) != null) {
             if (idx != null) @compileError("only one union(enum) subcommand field is allowed");
             idx = i;
         }
@@ -430,30 +440,30 @@ pub fn usage(comptime T: type) []const u8 {
 
 fn generate_struct_usage(comptime T: type) []const u8 {
     return comptime blk: {
-        const fields = std.meta.fields(T);
-        const marker_idx = separator_index(fields);
+        const struct_info = @typeInfo(T).@"struct";
+        const marker_idx = separator_index(struct_info.field_names);
 
         var flags_text: []const u8 = "";
         var commands_text: []const u8 = "";
         var positionals_text: []const u8 = "";
 
-        for (fields, 0..) |field, i| {
+        for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, 0..) |field_name, FieldType, field_attrs, i| {
             if (marker_idx) |idx| {
                 if (i > idx) {
-                    positionals_text = positionals_text ++ "  " ++ field.name ++ "  " ++
-                        type_label(field.type) ++ default_label(field) ++ "\n";
+                    positionals_text = positionals_text ++ "  " ++ field_name ++ "  " ++
+                        type_label(FieldType) ++ default_label(FieldType, field_attrs) ++ "\n";
                     continue;
                 }
             }
-            if (std.mem.eql(u8, field.name, "--")) {
+            if (std.mem.eql(u8, field_name, "--")) {
                 continue;
-            } else if (subcommand_info(field.type)) |sc_info| {
-                for (std.meta.fields(sc_info.union_type)) |variant| {
-                    commands_text = commands_text ++ "  " ++ variant.name ++ "\n";
+            } else if (subcommand_info(FieldType)) |sc_info| {
+                for (@typeInfo(sc_info.union_type).@"union".field_names) |variant_name| {
+                    commands_text = commands_text ++ "  " ++ variant_name ++ "\n";
                 }
             } else {
-                flags_text = flags_text ++ "  " ++ flag_syntax(field) ++ "  " ++
-                    type_label(field.type) ++ default_label(field) ++ "\n";
+                flags_text = flags_text ++ "  " ++ flag_syntax(field_name, FieldType) ++ "  " ++
+                    type_label(FieldType) ++ default_label(FieldType, field_attrs) ++ "\n";
             }
         }
 
@@ -465,30 +475,33 @@ fn generate_struct_usage(comptime T: type) []const u8 {
     };
 }
 
-fn flag_syntax(comptime field: std.builtin.Type.StructField) []const u8 {
-    const value_type = switch (@typeInfo(field.type)) {
+fn flag_syntax(comptime field_name: [:0]const u8, comptime FieldType: type) []const u8 {
+    const value_type = switch (@typeInfo(FieldType)) {
         .optional => |optional_info| optional_info.child,
-        else => field.type,
+        else => FieldType,
     };
     const value_suffix = if (value_type == bool) "[=true|false]" else "=<value>";
-    return "--" ++ field.name ++ value_suffix;
+    return "--" ++ field_name ++ value_suffix;
 }
 
 fn generate_union_usage(comptime T: type) []const u8 {
     return comptime blk: {
         var out: []const u8 = "Commands:\n";
-        for (std.meta.fields(T)) |field| {
-            out = out ++ "  " ++ field.name ++ "\n";
+        for (@typeInfo(T).@"union".field_names) |field_name| {
+            out = out ++ "  " ++ field_name ++ "\n";
         }
         break :blk out;
     };
 }
 
-fn default_label(comptime field: std.builtin.Type.StructField) []const u8 {
-    if (@typeInfo(field.type) == .optional) return " (optional)";
-    if (is_repeatable(field.type)) return " (repeatable)";
-    if (field.defaultValue()) |default_value| {
-        return " (default: " ++ value_to_string(field.type, default_value) ++ ")";
+fn default_label(
+    comptime FieldType: type,
+    comptime field_attrs: std.lang.Type.Struct.FieldAttributes,
+) []const u8 {
+    if (@typeInfo(FieldType) == .optional) return " (optional)";
+    if (is_repeatable(FieldType)) return " (repeatable)";
+    if (field_attrs.defaultValue(FieldType)) |default_value| {
+        return " (default: " ++ value_to_string(FieldType, default_value) ++ ")";
     }
     return " (required)";
 }

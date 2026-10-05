@@ -2,6 +2,8 @@
 
 A type-safe command-line argument parser for Zig. Inspired by **Rust clap** and **TigerBeetle's flags**, it lets you define flags using a struct or union(enum) and parses command-line arguments into it.
 
+Requires Zig 0.17.0 or newer.
+
 - Comptime-driven schema. Argument scanning and value conversion happen at runtime.
 - Type safety. Catch errors at compile time, not runtime.
 - Idiomatic Zig. Works with the grain of the language.
