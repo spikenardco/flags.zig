@@ -114,7 +114,11 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     var seen = std.mem.zeroes([named_field_names.len]bool);
     var positional_index: usize = 0;
 
-    var list_values: [named_field_names.len]std.ArrayList([]const u8) = undefined;
+    const ListValue = struct {
+        raw: []const u8,
+        token: []const u8,
+    };
+    var list_values: [named_field_names.len]std.ArrayList(ListValue) = undefined;
     // Keep every slot initialized. Only list fields use these values.
     inline for (&list_values) |*list_value| list_value.* = .empty;
     defer {
@@ -133,6 +137,11 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
             }
 
             if (std.mem.eql(u8, arg, "--")) {
+                if (positional_field_names.len == 0) {
+                    diag.token = arg;
+                    diag.message = "unexpected argument";
+                    return error.UnexpectedArgument;
+                }
                 positional_only = true;
                 continue;
             }
@@ -159,7 +168,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                                 diag.message = "missing value";
                                 return error.MissingValue;
                             };
-                            try list_values[field_index].append(allocator, fv);
+                            try list_values[field_index].append(allocator, .{ .raw = fv, .token = arg });
                             seen[field_index] = true;
                         } else {
                             if (seen[field_index]) {
@@ -242,8 +251,12 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
                 const items = list_values[field_index].items;
                 const child = comptime @typeInfo(FieldType).pointer.child;
                 const typed = try allocator.alloc(child, items.len);
-                for (items, 0..) |raw, j| {
-                    typed[j] = try parse_scalar(allocator, child, raw);
+                for (items, 0..) |item, j| {
+                    typed[j] = parse_scalar(allocator, child, item.raw) catch |err| {
+                        diag.token = item.token;
+                        diag.message = comptime "invalid value for --" ++ field_name ++ ", expected " ++ type_label(child);
+                        return err;
+                    };
                 }
                 @field(result, field_name) = typed;
             } else {
@@ -843,6 +856,15 @@ test "missing value" {
     try std.testing.expectEqualStrings("missing value", ta.diag.message.?);
 }
 
+test "terminator rejected without positionals" {
+    var ta = TestArena.init();
+    defer ta.deinit();
+    const Args = struct { verbose: bool = false };
+    try std.testing.expectError(error.UnexpectedArgument, ta.run(Args, &.{ "prog", "--" }));
+    try std.testing.expectEqualStrings("--", ta.diag.token.?);
+    try std.testing.expectEqualStrings("unexpected argument", ta.diag.message.?);
+}
+
 test "terminator disables help parsing" {
     var ta = TestArena.init();
     defer ta.deinit();
@@ -987,6 +1009,8 @@ test "list invalid element" {
     defer ta.deinit();
     const Args = struct { ports: []const u16 = &.{} };
     try std.testing.expectError(error.InvalidValue, ta.run(Args, &.{ "prog", "--ports=80", "--ports=bad" }));
+    try std.testing.expectEqualStrings("--ports=bad", ta.diag.token.?);
+    try std.testing.expectEqualStrings("invalid value for --ports, expected u16", ta.diag.message.?);
 }
 
 test "global flags with subcommand" {
