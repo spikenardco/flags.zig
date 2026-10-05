@@ -158,7 +158,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
                 var found = false;
                 inline for (named_field_names, named_field_types, 0..) |field_name, FieldType, field_index| {
-                    if (comptime subcommand_info(FieldType) != null) continue;
+                    if (comptime subcommand_type(FieldType) != null) continue;
                     if (std.mem.eql(u8, flag_name, field_name)) {
                         found = true;
 
@@ -206,7 +206,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
 
             if (comptime subcommand_idx) |si| {
                 const subcommand_name = named_field_names[si];
-                const UnionT = comptime subcommand_info(named_field_types[si]).?.union_type;
+                const UnionT = comptime subcommand_type(named_field_types[si]).?;
                 const parsed = try dispatch_subcommand(allocator, args[i..], UnionT, diag);
                 @field(result, subcommand_name) = parsed;
                 seen[si] = true;
@@ -239,7 +239,7 @@ fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime 
     }
 
     inline for (named_field_names, named_field_types, named_field_attrs, 0..) |field_name, FieldType, field_attrs, field_index| {
-        if (comptime subcommand_info(FieldType) != null) {
+        if (comptime subcommand_type(FieldType) != null) {
             if (!seen[field_index]) {
                 set_default_or_null(field_name, FieldType, field_attrs, &result, error.MissingSubcommand) catch |err| {
                     diag.message = "missing required subcommand";
@@ -399,22 +399,16 @@ fn is_repeatable(comptime T: type) bool {
     };
 }
 
-/// Info about a tagged union field that acts as a subcommand carrier.
-/// The field may be a bare union(enum) (required) or an optional one (optional).
-const SubcommandInfo = struct {
-    union_type: type,
-};
-
-/// If T is a tagged union (possibly wrapped in optional), return SubcommandInfo.
-fn subcommand_info(comptime T: type) ?SubcommandInfo {
+/// If T is a tagged union (possibly wrapped in optional), return its union type.
+fn subcommand_type(comptime T: type) ?type {
     return switch (@typeInfo(T)) {
         .@"union" => |union_info| if (union_info.tag_type != null)
-            .{ .union_type = T }
+            T
         else
             null,
         .optional => |o| switch (@typeInfo(o.child)) {
             .@"union" => |union_info| if (union_info.tag_type != null)
-                .{ .union_type = o.child }
+                o.child
             else
                 null,
             else => null,
@@ -427,7 +421,7 @@ fn subcommand_info(comptime T: type) ?SubcommandInfo {
 fn find_subcommand_field(comptime field_types: []const type) ?usize {
     var idx: ?usize = null;
     for (field_types, 0..) |FieldType, i| {
-        if (subcommand_info(FieldType) != null) {
+        if (subcommand_type(FieldType) != null) {
             if (idx != null) @compileError("only one union(enum) subcommand field is allowed");
             idx = i;
         }
@@ -470,8 +464,8 @@ fn generate_struct_usage(comptime T: type) []const u8 {
             }
             if (std.mem.eql(u8, field_name, "--")) {
                 continue;
-            } else if (subcommand_info(FieldType)) |sc_info| {
-                for (@typeInfo(sc_info.union_type).@"union".field_names) |variant_name| {
+            } else if (subcommand_type(FieldType)) |UnionT| {
+                for (@typeInfo(UnionT).@"union".field_names) |variant_name| {
                     commands_text = commands_text ++ "  " ++ variant_name ++ "\n";
                 }
             } else {
