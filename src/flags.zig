@@ -27,6 +27,22 @@ pub const Diagnostic = struct {
     }
 };
 
+/// Errors returned by `parse`.
+pub const ParseError = std.mem.Allocator.Error || error{
+    DuplicateFlag,
+    EmptyArgs,
+    HelpRequested,
+    InvalidValue,
+    MissingRequiredFlag,
+    MissingRequiredPositional,
+    MissingSubcommand,
+    MissingValue,
+    TooManyPositionals,
+    UnexpectedArgument,
+    UnknownFlag,
+    UnknownSubcommand,
+};
+
 /// Parse args into a struct (single command) or union(enum) (subcommands).
 ///
 /// Caller passes full argv; the parser skips argv[0] (the program name).
@@ -43,7 +59,7 @@ pub fn parse(
     args: []const []const u8,
     comptime T: type,
     diag: *Diagnostic,
-) !T {
+) ParseError!T {
     diag.* = .{};
     if (args.len == 0) {
         diag.message = "no arguments provided";
@@ -69,8 +85,8 @@ fn set_default_or_null(
     comptime FieldType: type,
     comptime field_attrs: std.lang.Type.Struct.FieldAttributes,
     result: anytype,
-    comptime error_type: anyerror,
-) !void {
+    comptime error_type: ParseError,
+) ParseError!void {
     if (field_attrs.defaultValue(FieldType)) |default| {
         @field(result, field_name) = default;
     } else if (comptime @typeInfo(FieldType) == .optional) {
@@ -89,7 +105,7 @@ fn separator_index(comptime field_names: []const [:0]const u8) ?usize {
 }
 
 /// Parse a struct schema of named flags and optional positional args.
-fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
+fn parse_flags(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) ParseError!T {
     const struct_info = @typeInfo(T).@"struct";
     const marker_idx = comptime separator_index(struct_info.field_names);
     const named_field_names = if (marker_idx) |idx| struct_info.field_names[0..idx] else struct_info.field_names;
@@ -305,7 +321,7 @@ fn type_label(comptime T: type) []const u8 {
 }
 
 /// Unwrap optional types before parsing the inner scalar value.
-fn parse_value(allocator: std.mem.Allocator, comptime T: type, value: ?[]const u8) !T {
+fn parse_value(allocator: std.mem.Allocator, comptime T: type, value: ?[]const u8) ParseError!T {
     if (@typeInfo(T) == .optional) {
         return try parse_scalar(allocator, @typeInfo(T).optional.child, value);
     }
@@ -313,7 +329,7 @@ fn parse_value(allocator: std.mem.Allocator, comptime T: type, value: ?[]const u
 }
 
 /// Parse a scalar type: bool, int, float, enum, or string.
-fn parse_scalar(allocator: std.mem.Allocator, comptime T: type, value: ?[]const u8) !T {
+fn parse_scalar(allocator: std.mem.Allocator, comptime T: type, value: ?[]const u8) ParseError!T {
     if (T == bool) {
         if (value == null) return true;
         return parse_bool(value.?);
@@ -333,7 +349,7 @@ fn parse_scalar(allocator: std.mem.Allocator, comptime T: type, value: ?[]const 
 }
 
 /// Parse a boolean string value; accepts "true" or "false" only.
-fn parse_bool(value: []const u8) !bool {
+fn parse_bool(value: []const u8) ParseError!bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
     return error.InvalidValue;
@@ -345,7 +361,7 @@ fn parse_subcommand_payload(
     comptime Payload: type,
     args: []const []const u8,
     diag: *Diagnostic,
-) !Payload {
+) ParseError!Payload {
     const sc_type_info = @typeInfo(Payload);
     return switch (sc_type_info) {
         .@"struct" => try parse_flags(allocator, args, Payload, diag),
@@ -365,7 +381,7 @@ fn parse_subcommand_payload(
 }
 
 /// Match and parse the first arg as a subcommand name, then parse the rest.
-fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) !T {
+fn dispatch_subcommand(allocator: std.mem.Allocator, args: []const []const u8, comptime T: type, diag: *Diagnostic) ParseError!T {
     const union_info = @typeInfo(T).@"union";
 
     if (args.len == 0) {
